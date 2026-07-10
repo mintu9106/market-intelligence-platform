@@ -1,0 +1,483 @@
+# =============================================================================
+# .gitignore — AI-Powered Indian Stock Market Intelligence Platform
+# Covers: Python, Node.js, Docker, IDE, OS, Environment, Secrets
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# SECRETS & CREDENTIALS — NEVER COMMIT THESE
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cert
+*.crt
+secrets/
+.secrets/
+credentials/
+**/*.secret
+**/secret.json
+**/secrets.json
+**/credentials.json
+**/service-account*.json
+
+# -----------------------------------------------------------------------------
+# PYTHON
+# -----------------------------------------------------------------------------
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytestdebug.log
+
+# Translations
+*.mo
+*.pot
+
+# Django (if used)
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask (if used)
+instance/
+.webassets-cache
+
+# Scrapy (if used)
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+docs/build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.virtualenv/
+
+# Spyder IDE
+.spyderproject.db
+.spyproject
+
+# Rope IDE
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# ruff
+.ruff_cache/
+
+# -----------------------------------------------------------------------------
+# NODE.JS / JAVASCRIPT / TYPESCRIPT
+# -----------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage
+lib-cov/
+coverage/
+*.lcov
+.nyc_output/
+
+# Grunt intermediate storage
+.grunt/
+
+# Bower components
+bower_components/
+
+# node-waf configuration
+.lock-wscript
+
+# Build outputs
+/frontend/web/.next/
+/frontend/web/out/
+/frontend/web/build/
+/frontend/mobile/.expo/
+/frontend/mobile/dist/
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Optional npm cache
+.npm/
+
+# Optional eslint cache
+.eslintcache
+
+# Storybook
+storybook-static/
+
+# Microbundle cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+.node_repl_history
+
+# Yarn Integrity file
+.yarn-integrity
+
+# parcel-bundler cache
+.cache/
+.parcel-cache/
+
+# Next.js
+.next/
+out/
+
+# Nuxt.js
+.nuxt/
+
+# Gatsby
+.cache/
+public/
+
+# VuePress
+.vuepress/dist/
+
+# Serverless
+.serverless/
+
+# FuseBox cache
+.fusebox/
+
+# DynamoDB Local
+.dynamodb/
+
+# Yarn v2
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+
+# -----------------------------------------------------------------------------
+# DOCKER
+# -----------------------------------------------------------------------------
+# Docker override files (keep docker-compose.yml but ignore local overrides)
+docker-compose.override.yml
+docker-compose.local.yml
+.docker/
+
+# -----------------------------------------------------------------------------
+# MACHINE LEARNING & DATA
+# -----------------------------------------------------------------------------
+# Model artifacts (tracked via MLflow/S3, not Git)
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.onnx
+*.joblib
+*.bin
+models/artifacts/
+mlruns/
+mlartifacts/
+
+# Large data files (stored in S3/TimescaleDB, not Git)
+*.csv
+*.parquet
+*.arrow
+*.feather
+*.json.gz
+*.ndjson
+data/raw/
+data/processed/
+data/external/
+
+# Jupyter notebooks (committed only if explicitly needed)
+# *.ipynb  <- uncomment to exclude notebooks
+
+# Feature Store artifacts
+feature_store/
+feast_feature_store/
+
+# -----------------------------------------------------------------------------
+# TERRAFORM
+# -----------------------------------------------------------------------------
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+.terraform.lock.hcl
+
+# -----------------------------------------------------------------------------
+# KUBERNETES / HELM
+# -----------------------------------------------------------------------------
+# Helm chart dependencies (fetched at deploy time)
+charts/
+*.tgz
+
+# Kubeconfig (contains cluster credentials)
+kubeconfig
+*.kubeconfig
+.kube/
+
+# ArgoCD application secrets
+argocd-secret.yaml
+*-secret.yaml
+
+# -----------------------------------------------------------------------------
+# IDEs AND EDITORS
+# -----------------------------------------------------------------------------
+# VSCode
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+
+# IntelliJ IDEA / PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Eclipse
+.project
+.classpath
+.settings/
+
+# NetBeans
+/nbproject/private/
+
+# -----------------------------------------------------------------------------
+# OPERATING SYSTEM
+# -----------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# -----------------------------------------------------------------------------
+# LOGS
+# -----------------------------------------------------------------------------
+logs/
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# -----------------------------------------------------------------------------
+# TEMPORARY FILES
+# -----------------------------------------------------------------------------
+tmp/
+temp/
+.tmp/
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*.rej
+
+# -----------------------------------------------------------------------------
+# TESTING
+# -----------------------------------------------------------------------------
+.coverage
+coverage/
+htmlcov/
+test-results/
+junit.xml
+pytest.xml
+
+# -----------------------------------------------------------------------------
+# CLOUD PROVIDER ARTIFACTS
+# -----------------------------------------------------------------------------
+# AWS
+.aws/credentials
+aws-exports.js
+
+# GCP
+application_default_credentials.json
+gcloud/
+
+# -----------------------------------------------------------------------------
+# MISC
+# -----------------------------------------------------------------------------
+# Backtest result artifacts (stored in S3)
+backtest_results/
+
+# Profiling
+*.prof
+*.lprof
+
+# Compressed files (unless intentional)
+# *.zip
+# *.tar.gz
+
+# Lock files (check-in policy varies — we check in for reproducibility)
+# Uncomment below to ignore lock files:
+# package-lock.json
+# yarn.lock
