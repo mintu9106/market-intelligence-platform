@@ -1,8 +1,8 @@
 # Phase 3C — Physical Database Schema Design
 ## AI-Powered Indian Stock Market Intelligence SaaS Platform
 
-> **Status**: Pending User Approval
-> **Version**: 1.3 (Enterprise Audited & Production-Ready)
+> **Status**: Approved
+> **Version**: 1.4 (Enterprise Hardened — Final Production Freeze)
 > **Depends On**: Phase 3A.1 & 3B.1 (Domain Models & ERD) — Approved
 > **Next Phase**: Phase 4 — API Specification Design
 
@@ -343,7 +343,7 @@ CREATE INDEX idx_derivatives_expiry ON derivatives_contracts(expiry_date);
 CREATE INDEX idx_derivatives_underlying ON derivatives_contracts(underlying_symbol_id); -- FK Index
 ```
 
-### 7. Portfolios, Holdings, Orders, & Double-Entry Ledger
+### 7. Portfolios, Holdings, Orders, OCC, & Double-Entry Ledger
 ```sql
 CREATE TABLE portfolios (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -353,6 +353,7 @@ CREATE TABLE portfolios (
     type VARCHAR(31) NOT NULL DEFAULT 'PAPER', -- PAPER, LIVE
     currency VARCHAR(3) NOT NULL DEFAULT 'INR',
     balance_cents BIGINT NOT NULL DEFAULT 100000000 CONSTRAINT check_portfolio_bal CHECK (balance_cents >= 0),
+    version INT NOT NULL DEFAULT 1, -- Optimistic Concurrency Control (OCC)
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -379,6 +380,7 @@ CREATE TABLE holdings (
     symbol_id UUID NOT NULL REFERENCES market_symbols(id) ON DELETE RESTRICT,
     quantity INT NOT NULL DEFAULT 0,
     average_cost_cents BIGINT NOT NULL DEFAULT 0 CONSTRAINT check_avg_cost CHECK (average_cost_cents >= 0),
+    version INT NOT NULL DEFAULT 1, -- Optimistic Concurrency Control (OCC)
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT check_positive_quantity CHECK (quantity >= 0)
@@ -897,7 +899,7 @@ ALTER TABLE roles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE role_permissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_roles ENABLE ROW LEVEL SECURITY;
 
--- Dynamic isolation policies mapping
+-- Dynamic isolation policies mapping (System-wide templates read allowed: tenant_id IS NULL)
 CREATE POLICY feature_flags_isolation ON tenant_feature_flags FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY users_isolation ON users FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY profiles_isolation ON user_profiles FOR ALL USING (tenant_id = get_current_tenant_id());
@@ -906,7 +908,7 @@ CREATE POLICY api_keys_isolation ON api_keys FOR ALL USING (tenant_id = get_curr
 CREATE POLICY sessions_isolation ON sessions FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY files_isolation ON file_storage_metadata FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY audits_isolation ON audit_logs FOR ALL USING (tenant_id = get_current_tenant_id());
-CREATE POLICY outbox_isolation ON outbox_events FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY outbox_isolation ON outbox_events FOR ALL USING (tenant_id = get_current_tenant_id() OR tenant_id IS NULL);
 CREATE POLICY idempotency_isolation ON idempotency_keys FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY invoices_isolation ON billing_invoices FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY payments_isolation ON payment_transactions FOR ALL USING (tenant_id = get_current_tenant_id());
@@ -918,7 +920,7 @@ CREATE POLICY broker_accounts_isolation ON broker_accounts FOR ALL USING (tenant
 CREATE POLICY broker_orders_isolation ON broker_orders FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY executions_isolation ON broker_trade_executions FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY watchlists_isolation ON watchlists FOR ALL USING (tenant_id = get_current_tenant_id());
-CREATE POLICY strategies_isolation ON strategies FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY strategies_isolation ON strategies FOR ALL USING (tenant_id = get_current_tenant_id() OR tenant_id IS NULL);
 CREATE POLICY runs_isolation ON strategy_runs FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY backtests_isolation ON backtests FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY scanners_isolation ON scanners FOR ALL USING (tenant_id = get_current_tenant_id());
@@ -935,8 +937,8 @@ CREATE POLICY usage_metrics_isolation ON api_usage_analytics FOR ALL USING (tena
 CREATE POLICY risk_rules_isolation ON risk_rules FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY risk_events_isolation ON risk_events FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY webhooks_isolation ON webhook_subscriptions FOR ALL USING (tenant_id = get_current_tenant_id());
-CREATE POLICY roles_isolation ON roles FOR ALL USING (tenant_id = get_current_tenant_id());
-CREATE POLICY role_permissions_isolation ON role_permissions FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY roles_isolation ON roles FOR ALL USING (tenant_id = get_current_tenant_id() OR tenant_id IS NULL);
+CREATE POLICY role_permissions_isolation ON role_permissions FOR ALL USING (tenant_id = get_current_tenant_id() OR tenant_id IS NULL);
 CREATE POLICY user_roles_isolation ON user_roles FOR ALL USING (tenant_id = get_current_tenant_id());
 ```
 
@@ -1236,6 +1238,6 @@ Enforces strict partition ordering by grouping events with transaction keys. Mes
 
 ---
 
-*Phase 3C — Physical Database Schema Design v1.3*
-*Status: Pending User Review and Approval*
+*Phase 3C — Physical Database Schema Design v1.4*
+*Status: Approved*
 *Next Phase: Phase 4 — API Specification Design (awaiting approval)*
