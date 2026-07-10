@@ -2,7 +2,7 @@
 ## AI-Powered Indian Stock Market Intelligence SaaS Platform
 
 > **Status**: Pending User Approval
-> **Version**: 1.1 (Extended Enterprise-Grade Spec)
+> **Version**: 1.2 (Enterprise Audit & Production-Ready Spec)
 > **Depends On**: Phase 3A.1 & 3B.1 (Domain Models & ERD) — Approved
 > **Next Phase**: Phase 4 — API Specification Design
 
@@ -30,7 +30,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 ```
 
-### 2. Core Tenant & Identity Tables
+### 2. Core Tenant, Subscription, & Feature Flag Tables
 ```sql
 CREATE TABLE tenants (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -42,10 +42,24 @@ CREATE TABLE tenants (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE tenant_feature_flags (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    feature_name VARCHAR(127) NOT NULL,
+    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    quota_limit INT NOT NULL DEFAULT 0, -- 0 means unlimited
+    usage_counter INT NOT NULL DEFAULT 0,
+    reset_interval VARCHAR(31) NOT NULL DEFAULT 'NEVER', -- DAILY, MONTHLY, NEVER
+    last_reset_at TIMESTAMP WITH TIME ZONE,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(tenant_id, feature_name)
+);
+CREATE INDEX idx_tenant_features_name ON tenant_feature_flags(tenant_id, feature_name);
+
 CREATE TABLE subscription_plans (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(63) NOT NULL UNIQUE, -- FREE, TRIAL, PRO, ENTERPRISE
-    price_cents INT NOT NULL DEFAULT 0,
+    price_cents INT NOT NULL DEFAULT 0 CONSTRAINT check_plan_price CHECK (price_cents >= 0),
     currency VARCHAR(3) NOT NULL DEFAULT 'INR',
     watchlist_limit INT NOT NULL DEFAULT 1,
     portfolio_limit INT NOT NULL DEFAULT 1,
@@ -68,7 +82,10 @@ CREATE TABLE tenant_subscriptions (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_tenant_subs_tenant ON tenant_subscriptions(tenant_id);
+```
 
+### 3. Identity & Role-Based Access Control
+```sql
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -114,17 +131,21 @@ CREATE TABLE permissions (
 CREATE TABLE role_permissions (
     role_id UUID NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
     permission_id UUID NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+    tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE, -- NULL for system-wide defaults
     PRIMARY KEY (role_id, permission_id)
 );
+CREATE INDEX idx_role_permissions_tenant ON role_permissions(tenant_id);
 
 CREATE TABLE user_roles (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role_id UUID NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     PRIMARY KEY (user_id, role_id)
 );
+CREATE INDEX idx_user_roles_tenant ON user_roles(tenant_id);
 ```
 
-### 3. API Key, Session, File Storage, & Audit Tables
+### 4. Sessions, API Keys, Audit Logs, & Transactional Outbox
 ```sql
 CREATE TABLE api_keys (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -157,9 +178,9 @@ CREATE TABLE file_storage_metadata (
     uploaded_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     bucket_name VARCHAR(127) NOT NULL,
     s3_key VARCHAR(511) NOT NULL UNIQUE,
-    file_type VARCHAR(63) NOT NULL, -- BACKTEST_REPORT, TAX_REPORT, USER_EXISTS
+    file_type VARCHAR(63) NOT NULL, -- BACKTEST_REPORT, TAX_REPORT, MODEL_WEIGHTS
     mime_type VARCHAR(127) NOT NULL,
-    size_bytes BIGINT NOT NULL,
+    size_bytes BIGINT NOT NULL CONSTRAINT check_file_size CHECK (size_bytes >= 0),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_files_tenant ON file_storage_metadata(tenant_id);
@@ -180,9 +201,39 @@ CREATE TABLE audit_logs (
 -- BRIN index on time-sequential audit logs to save index space
 CREATE INDEX idx_audit_logs_brin ON audit_logs USING brin(created_at);
 CREATE INDEX idx_audit_logs_tenant_action ON audit_logs(tenant_id, action);
+
+-- Transactional Outbox Table for Reliability and Kafka Event Duplication
+CREATE TABLE outbox_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE, -- NULL for system events
+    topic VARCHAR(127) NOT NULL, -- Kafka topic target
+    key VARCHAR(255) NOT NULL, -- Kafka partition key
+    payload JSONB NOT NULL,
+    status VARCHAR(31) NOT NULL DEFAULT 'PENDING', -- PENDING, PROCESSED, FAILED
+    error_message TEXT,
+    retry_count INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX idx_outbox_events_pending ON outbox_events(status, created_at) WHERE status = 'PENDING';
+
+-- API Request Idempotency Key Ledger
+CREATE TABLE idempotency_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key_value VARCHAR(255) NOT NULL,
+    request_path VARCHAR(511) NOT NULL,
+    response_code INT,
+    response_body TEXT,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(tenant_id, user_id, key_value)
+);
+CREATE INDEX idx_idempotency_expiry ON idempotency_keys(expires_at);
 ```
 
-### 4. Billing, Invoices, & Payment Tracking
+### 5. Billing, Invoices, & Payment Tracking
 ```sql
 CREATE TABLE billing_invoices (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -190,9 +241,9 @@ CREATE TABLE billing_invoices (
     invoice_number VARCHAR(127) NOT NULL UNIQUE,
     status VARCHAR(31) NOT NULL DEFAULT 'UNPAID', -- UNPAID, PAID, VOIDED, OVERDUE
     currency VARCHAR(3) NOT NULL DEFAULT 'INR',
-    amount_cents BIGINT NOT NULL DEFAULT 0,
-    tax_cents BIGINT NOT NULL DEFAULT 0, -- India GST calculation logic
-    discount_cents BIGINT NOT NULL DEFAULT 0,
+    amount_cents BIGINT NOT NULL DEFAULT 0 CONSTRAINT check_invoice_amount CHECK (amount_cents >= 0),
+    tax_cents BIGINT NOT NULL DEFAULT 0 CONSTRAINT check_invoice_tax CHECK (tax_cents >= 0), -- India GST
+    discount_cents BIGINT NOT NULL DEFAULT 0 CONSTRAINT check_invoice_discount CHECK (discount_cents >= 0),
     due_date DATE NOT NULL,
     billing_period_start DATE NOT NULL,
     billing_period_end DATE NOT NULL,
@@ -206,10 +257,11 @@ CREATE TABLE billing_invoice_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     invoice_id UUID NOT NULL REFERENCES billing_invoices(id) ON DELETE CASCADE,
     description VARCHAR(255) NOT NULL,
-    quantity INT NOT NULL DEFAULT 1,
-    unit_price_cents BIGINT NOT NULL DEFAULT 0,
+    quantity INT NOT NULL DEFAULT 1 CONSTRAINT check_item_qty CHECK (quantity > 0),
+    unit_price_cents BIGINT NOT NULL DEFAULT 0 CONSTRAINT check_item_price CHECK (unit_price_cents >= 0),
     tax_rate_bps INT NOT NULL DEFAULT 1800, -- 18% standard GST
-    amount_cents BIGINT NOT NULL DEFAULT 0
+    -- Enforce deterministic line calculation
+    amount_cents BIGINT GENERATED ALWAYS AS (quantity * unit_price_cents) STORED
 );
 
 CREATE TABLE payment_transactions (
@@ -219,8 +271,8 @@ CREATE TABLE payment_transactions (
     payment_method VARCHAR(63) NOT NULL, -- RAZORPAY, STRIPE
     external_transaction_id VARCHAR(255) NOT NULL UNIQUE,
     status VARCHAR(31) NOT NULL DEFAULT 'PENDING', -- PENDING, SETTLED, FAILED, REFUNDED
-    amount_cents BIGINT NOT NULL,
-    fee_cents INT DEFAULT 0,
+    amount_cents BIGINT NOT NULL CONSTRAINT check_pay_amount CHECK (amount_cents >= 0),
+    fee_cents INT DEFAULT 0 CONSTRAINT check_pay_fee CHECK (fee_cents >= 0),
     gateway_response JSONB,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -228,7 +280,7 @@ CREATE TABLE payment_transactions (
 CREATE INDEX idx_payments_invoice ON payment_transactions(invoice_id);
 ```
 
-### 5. Symbol Master & Derivatives Support
+### 6. Symbol Master & Derivatives Support
 ```sql
 CREATE TABLE exchanges (
     code VARCHAR(15) PRIMARY KEY, -- NSE, BSE
@@ -266,14 +318,14 @@ CREATE TABLE derivatives_contracts (
     underlying_symbol_id UUID NOT NULL REFERENCES market_symbols(id) ON DELETE RESTRICT,
     contract_type VARCHAR(15) NOT NULL, -- FUTURE, OPTION
     option_type VARCHAR(7), -- CALL, PUT, NULL for Futures
-    strike_price_cents BIGINT, -- NULL for Futures
+    strike_price_cents BIGINT CONSTRAINT check_strike_price CHECK (strike_price_cents >= 0), -- NULL for Futures
     expiry_date DATE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_derivatives_expiry ON derivatives_contracts(expiry_date);
 ```
 
-### 6. Portfolio, Holdings, Orders, & Executions
+### 7. Portfolios, Holdings, Orders, & Executions
 ```sql
 CREATE TABLE portfolios (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -282,7 +334,7 @@ CREATE TABLE portfolios (
     name VARCHAR(255) NOT NULL,
     type VARCHAR(31) NOT NULL DEFAULT 'PAPER', -- PAPER, LIVE
     currency VARCHAR(3) NOT NULL DEFAULT 'INR',
-    balance_cents BIGINT NOT NULL DEFAULT 100000000, -- 10,000,000.00 INR virtual capital
+    balance_cents BIGINT NOT NULL DEFAULT 100000000 CONSTRAINT check_portfolio_bal CHECK (balance_cents >= 0),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -294,12 +346,13 @@ CREATE TABLE holdings (
     portfolio_id UUID NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
     symbol_id UUID NOT NULL REFERENCES market_symbols(id) ON DELETE RESTRICT,
     quantity INT NOT NULL DEFAULT 0,
-    average_cost_cents BIGINT NOT NULL DEFAULT 0,
+    average_cost_cents BIGINT NOT NULL DEFAULT 0 CONSTRAINT check_avg_cost CHECK (average_cost_cents >= 0),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT check_positive_quantity CHECK (quantity >= 0)
 );
-CREATE UNIQUE INDEX idx_holding_portfolio_symbol ON holdings(portfolio_id, symbol_id);
+-- Covering index for performance aggregation
+CREATE UNIQUE INDEX idx_holdings_covering ON holdings(portfolio_id, symbol_id) INCLUDE (quantity, average_cost_cents);
 
 CREATE TABLE orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -309,16 +362,15 @@ CREATE TABLE orders (
     direction VARCHAR(15) NOT NULL, -- BUY, SELL
     type VARCHAR(15) NOT NULL, -- MARKET, LIMIT, STOP_LOSS, STOP_LOSS_LIMIT
     status VARCHAR(31) NOT NULL DEFAULT 'PENDING', -- PENDING, SUBMITTED, FILLED, CANCELLED, REJECTED
-    quantity INT NOT NULL,
-    price_cents BIGINT,
-    trigger_price_cents BIGINT,
+    quantity INT NOT NULL CONSTRAINT check_order_qty CHECK (quantity > 0),
+    price_cents BIGINT CONSTRAINT check_order_price CHECK (price_cents >= 0),
+    trigger_price_cents BIGINT CONSTRAINT check_trigger_price CHECK (trigger_price_cents >= 0),
     filled_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
--- Partial index to quickly process pending orders in queue
-CREATE INDEX idx_orders_pending ON orders(portfolio_id) WHERE status = 'PENDING';
--- BRIN index for temporal ordering queries
+-- Optimized Partial Index on Pending Orders
+CREATE INDEX idx_orders_pending_partial ON orders(portfolio_id) WHERE status = 'PENDING';
 CREATE INDEX idx_orders_brin ON orders USING brin(created_at);
 
 CREATE TABLE broker_integrations (
@@ -357,21 +409,21 @@ CREATE TABLE broker_trade_executions (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     broker_order_id UUID NOT NULL REFERENCES broker_orders(id) ON DELETE RESTRICT,
     external_execution_id VARCHAR(255) NOT NULL UNIQUE,
-    quantity INT NOT NULL,
-    execution_price_cents BIGINT NOT NULL,
-    brokerage_fee_cents INT DEFAULT 0,
-    stt_charges_cents INT DEFAULT 0, -- Securities Transaction Tax
-    exchange_txn_fee_cents INT DEFAULT 0,
-    gst_cents INT DEFAULT 0,
-    sebi_turnover_fee_cents INT DEFAULT 0,
-    stamp_duty_cents INT DEFAULT 0,
+    quantity INT NOT NULL CONSTRAINT check_exec_qty CHECK (quantity > 0),
+    execution_price_cents BIGINT NOT NULL CONSTRAINT check_exec_price CHECK (execution_price_cents >= 0),
+    brokerage_fee_cents INT DEFAULT 0 CONSTRAINT check_exec_brokerage CHECK (brokerage_fee_cents >= 0),
+    stt_charges_cents INT DEFAULT 0 CONSTRAINT check_exec_stt CHECK (stt_charges_cents >= 0), -- Securities Transaction Tax
+    exchange_txn_fee_cents INT DEFAULT 0 CONSTRAINT check_exec_fee CHECK (exchange_txn_fee_cents >= 0),
+    gst_cents INT DEFAULT 0 CONSTRAINT check_exec_gst CHECK (gst_cents >= 0),
+    sebi_turnover_fee_cents INT DEFAULT 0 CONSTRAINT check_exec_sebi CHECK (sebi_turnover_fee_cents >= 0),
+    stamp_duty_cents INT DEFAULT 0 CONSTRAINT check_exec_stamp CHECK (stamp_duty_cents >= 0),
     executed_at TIMESTAMP WITH TIME ZONE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_trade_executions_broker ON broker_trade_executions(broker_order_id);
 ```
 
-### 7. Scanners, Watchlists, & Custom Strategies
+### 8. Scanners, Watchlists, & Custom Strategies
 ```sql
 CREATE TABLE watchlists (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -446,23 +498,25 @@ CREATE INDEX idx_scanners_rules_gin ON scanners USING gin(rules);
 
 CREATE TABLE scanner_runs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, -- Scoped for RLS
     scanner_id UUID NOT NULL REFERENCES scanners(id) ON DELETE CASCADE,
     execution_time TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     duration_ms INT
 );
-CREATE INDEX idx_scanner_runs_time ON scanner_runs(execution_time DESC);
+CREATE INDEX idx_scanner_runs_tenant_time ON scanner_runs(tenant_id, execution_time DESC);
 
 CREATE TABLE scanner_matches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, -- Scoped for RLS
     scanner_run_id UUID NOT NULL REFERENCES scanner_runs(id) ON DELETE CASCADE,
     symbol_id UUID NOT NULL REFERENCES market_symbols(id) ON DELETE CASCADE,
     metric_snapshots JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX idx_scanner_matches_run ON scanner_matches(scanner_run_id);
+CREATE INDEX idx_scanner_matches_tenant_run ON scanner_matches(tenant_id, scanner_run_id);
 ```
 
-### 8. AI Infrastructure & Model Accuracy Metadata
+### 9. AI Infrastructure & Model Accuracy Metadata
 ```sql
 CREATE TABLE model_registries (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -536,7 +590,7 @@ CREATE TABLE prediction_accuracies (
 CREATE UNIQUE INDEX idx_model_accuracy_eval ON prediction_accuracies(model_version_id, eval_date);
 ```
 
-### 9. Signals, AI Chat, & Explainability History
+### 10. Signals, AI Chat, & Explainability History
 ```sql
 CREATE TABLE trade_signals (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -565,13 +619,15 @@ CREATE TABLE signal_performances (
 -- Explainability Compliance Archival Store (SHAP Matrices auditing)
 CREATE TABLE shap_explanations_history (
     prediction_id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, -- Scoped for RLS
     model_version_id UUID NOT NULL REFERENCES model_versions(id) ON DELETE RESTRICT,
     symbol_id UUID NOT NULL REFERENCES market_symbols(id) ON DELETE RESTRICT,
     shap_matrix JSONB NOT NULL, -- Raw weights mapping
     base_value DOUBLE PRECISION NOT NULL,
-    feature_values JSONB NOT NULL, -- Feature values at time of execution
+    feature_values JSONB NOT NULL, -- Feature values at execution timestamp
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_shap_history_tenant ON shap_explanations_history(tenant_id);
 CREATE INDEX idx_shap_history_symbol ON shap_explanations_history(symbol_id);
 
 CREATE TABLE ai_feedbacks (
@@ -600,7 +656,7 @@ CREATE TABLE ai_chat_histories (
 CREATE INDEX idx_ai_chat_brin ON ai_chat_histories USING brin(created_at);
 ```
 
-### 10. Alert Configurations & API Usage Metrics
+### 11. Alert Configurations & API Usage Metrics
 ```sql
 CREATE TABLE alert_rules (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -663,7 +719,7 @@ CREATE INDEX idx_api_usage_brin ON api_usage_analytics USING brin(created_at);
 CREATE INDEX idx_api_usage_metrics ON api_usage_analytics(tenant_id, endpoint_path, response_code);
 ```
 
-### 11. Risk Management, Webhooks, & News/Sentiment Contexts
+### 12. Risk Management, Webhooks, & News/Sentiment Contexts
 ```sql
 CREATE TABLE risk_rules (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -714,8 +770,8 @@ CREATE TABLE news_sentiment_scores (
     news_article_id UUID NOT NULL REFERENCES news_articles(id) ON DELETE CASCADE,
     symbol_id UUID NOT NULL REFERENCES market_symbols(id) ON DELETE CASCADE,
     sentiment_score_bps INT NOT NULL, -- Sentiment score scale -10000 to +10000
-    confidence_pct INT NOT NULL, -- 0 to 100
-    impact_multiplier INT NOT NULL DEFAULT 100, -- Scale multiplier (100 = 1.0x)
+    confidence_pct INT NOT NULL,
+    impact_multiplier INT NOT NULL DEFAULT 100,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX idx_news_sentiment_unique ON news_sentiment_scores(news_article_id, symbol_id);
@@ -729,15 +785,16 @@ CREATE TABLE economic_events (
     actual_value VARCHAR(63),
     forecast_value VARCHAR(63),
     previous_value VARCHAR(63),
-    impact_level VARCHAR(15) NOT NULL DEFAULT 'LOW', -- LOW, MEDIUM, HIGH
+    impact_level VARCHAR(15) NOT NULL DEFAULT 'LOW',
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_economic_release ON economic_events(release_time DESC);
 ```
 
-### 12. RLS Policies Configuration (Rule 1)
+### 13. RLS Policies Configuration (Rule 1)
 ```sql
--- Enable Row Level Security on all tenant tables
+-- Enable Row Level Security on all tenant tables (including extended specs)
+ALTER TABLE tenant_feature_flags ENABLE ROW LEVEL SECURITY;
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_subscriptions ENABLE ROW LEVEL SECURITY;
@@ -745,6 +802,8 @@ ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE file_storage_metadata ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE outbox_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE billing_invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payment_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE portfolios ENABLE ROW LEVEL SECURITY;
@@ -758,6 +817,9 @@ ALTER TABLE strategies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE strategy_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE backtests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE scanners ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scanner_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scanner_matches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE shap_explanations_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_feedbacks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ai_chat_histories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE alert_rules ENABLE ROW LEVEL SECURITY;
@@ -768,8 +830,12 @@ ALTER TABLE api_usage_analytics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE risk_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE risk_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE roles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE role_permissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_roles ENABLE ROW LEVEL SECURITY;
 
 -- Dynamic isolation policies mapping
+CREATE POLICY feature_flags_isolation ON tenant_feature_flags FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY users_isolation ON users FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY profiles_isolation ON user_profiles FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY subscriptions_isolation ON tenant_subscriptions FOR ALL USING (tenant_id = get_current_tenant_id());
@@ -777,6 +843,8 @@ CREATE POLICY api_keys_isolation ON api_keys FOR ALL USING (tenant_id = get_curr
 CREATE POLICY sessions_isolation ON sessions FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY files_isolation ON file_storage_metadata FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY audits_isolation ON audit_logs FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY outbox_isolation ON outbox_events FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY idempotency_isolation ON idempotency_keys FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY invoices_isolation ON billing_invoices FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY payments_isolation ON payment_transactions FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY portfolios_isolation ON portfolios FOR ALL USING (tenant_id = get_current_tenant_id());
@@ -790,6 +858,9 @@ CREATE POLICY strategies_isolation ON strategies FOR ALL USING (tenant_id = get_
 CREATE POLICY runs_isolation ON strategy_runs FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY backtests_isolation ON backtests FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY scanners_isolation ON scanners FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY scanner_runs_isolation ON scanner_runs FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY scanner_matches_isolation ON scanner_matches FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY shap_history_isolation ON shap_explanations_history FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY feedback_isolation ON ai_feedbacks FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY chat_history_isolation ON ai_chat_histories FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY alert_rules_isolation ON alert_rules FOR ALL USING (tenant_id = get_current_tenant_id());
@@ -800,6 +871,9 @@ CREATE POLICY usage_metrics_isolation ON api_usage_analytics FOR ALL USING (tena
 CREATE POLICY risk_rules_isolation ON risk_rules FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY risk_events_isolation ON risk_events FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY webhooks_isolation ON webhook_subscriptions FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY roles_isolation ON roles FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY role_permissions_isolation ON role_permissions FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY user_roles_isolation ON user_roles FOR ALL USING (tenant_id = get_current_tenant_id());
 ```
 
 ---
@@ -813,11 +887,11 @@ Built in **TimescaleDB** using hypertable abstractions. We define the continuous
 CREATE TABLE market_ticks (
     time TIMESTAMP WITH TIME ZONE NOT NULL,
     symbol_id UUID NOT NULL,
-    ltp_cents BIGINT NOT NULL,
-    ltq INT NOT NULL,
-    atp_cents BIGINT NOT NULL,
-    total_volume BIGINT NOT NULL,
-    open_interest BIGINT NOT NULL,
+    ltp_cents BIGINT NOT NULL CONSTRAINT check_tick_ltp CHECK (ltp_cents >= 0),
+    ltq INT NOT NULL CONSTRAINT check_tick_ltq CHECK (ltq >= 0),
+    atp_cents BIGINT NOT NULL CONSTRAINT check_tick_atp CHECK (atp_cents >= 0),
+    total_volume BIGINT NOT NULL CONSTRAINT check_tick_vol CHECK (total_volume >= 0),
+    open_interest BIGINT NOT NULL CONSTRAINT check_tick_oi CHECK (open_interest >= 0),
     bid_price_cents BIGINT,
     ask_price_cents BIGINT,
     bid_qty INT,
@@ -1087,6 +1161,6 @@ Enforces strict partition ordering by grouping events with transaction keys. Mes
 
 ---
 
-*Phase 3C — Physical Database Schema Design v1.1*
+*Phase 3C — Physical Database Schema Design v1.2*
 *Status: Pending User Review and Approval*
 *Next Phase: Phase 4 — API Specification Design (awaiting approval)*
