@@ -2,7 +2,7 @@
 ## AI-Powered Indian Stock Market Intelligence SaaS Platform
 
 > **Status**: Pending User Approval
-> **Version**: 1.2 (Enterprise Audit & Production-Ready Spec)
+> **Version**: 1.3 (Enterprise Audited & Production-Ready)
 > **Depends On**: Phase 3A.1 & 3B.1 (Domain Models & ERD) — Approved
 > **Next Phase**: Phase 4 — API Specification Design
 
@@ -19,6 +19,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS btree_gin;
 
 -- Helper function to extract tenant ID from current transaction context
+-- SECURITY DEFINER path hardened to prevent Search Path Hijacking
 CREATE OR REPLACE FUNCTION get_current_tenant_id()
 RETURNS UUID AS $$
 BEGIN
@@ -27,7 +28,7 @@ EXCEPTION
     WHEN OTHERS THEN
         RETURN NULL;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 ```
 
 ### 2. Core Tenant, Subscription, & Feature Flag Tables
@@ -82,6 +83,7 @@ CREATE TABLE tenant_subscriptions (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_tenant_subs_tenant ON tenant_subscriptions(tenant_id);
+CREATE INDEX idx_tenant_subs_plan ON tenant_subscriptions(plan_id); -- FK Index
 ```
 
 ### 3. Identity & Role-Based Access Control
@@ -89,7 +91,7 @@ CREATE INDEX idx_tenant_subs_tenant ON tenant_subscriptions(tenant_id);
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    email VARCHAR(255) NOT NULL UNIQUE,
+    email VARCHAR(255) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     status VARCHAR(31) NOT NULL DEFAULT 'ACTIVE', -- ACTIVE, SUSPENDED, PENDING_MFA
     mfa_secret VARCHAR(127),
@@ -97,6 +99,8 @@ CREATE TABLE users (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+-- Case-Insensitive Unique email check per Tenant to enforce security
+CREATE UNIQUE INDEX idx_users_email_ci ON users(tenant_id, LOWER(email));
 -- Optimized Partial Index for Active Users
 CREATE INDEX idx_users_active ON users(tenant_id, email) WHERE status = 'ACTIVE';
 
@@ -135,6 +139,8 @@ CREATE TABLE role_permissions (
     PRIMARY KEY (role_id, permission_id)
 );
 CREATE INDEX idx_role_permissions_tenant ON role_permissions(tenant_id);
+CREATE INDEX idx_role_permissions_role ON role_permissions(role_id);
+CREATE INDEX idx_role_permissions_perm ON role_permissions(permission_id); -- FK Index
 
 CREATE TABLE user_roles (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -143,6 +149,8 @@ CREATE TABLE user_roles (
     PRIMARY KEY (user_id, role_id)
 );
 CREATE INDEX idx_user_roles_tenant ON user_roles(tenant_id);
+CREATE INDEX idx_user_roles_user ON user_roles(user_id);
+CREATE INDEX idx_user_roles_role ON user_roles(role_id); -- FK Index
 ```
 
 ### 4. Sessions, API Keys, Audit Logs, & Transactional Outbox
@@ -171,6 +179,7 @@ CREATE TABLE sessions (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_sessions_token ON sessions(token_hash);
+CREATE INDEX idx_sessions_user ON sessions(user_id); -- FK Index
 
 CREATE TABLE file_storage_metadata (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -184,6 +193,7 @@ CREATE TABLE file_storage_metadata (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_files_tenant ON file_storage_metadata(tenant_id);
+CREATE INDEX idx_files_uploader ON file_storage_metadata(uploaded_by); -- FK Index
 
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -201,6 +211,7 @@ CREATE TABLE audit_logs (
 -- BRIN index on time-sequential audit logs to save index space
 CREATE INDEX idx_audit_logs_brin ON audit_logs USING brin(created_at);
 CREATE INDEX idx_audit_logs_tenant_action ON audit_logs(tenant_id, action);
+CREATE INDEX idx_audit_logs_user ON audit_logs(user_id); -- FK Index
 
 -- Transactional Outbox Table for Reliability and Kafka Event Duplication
 CREATE TABLE outbox_events (
@@ -215,7 +226,8 @@ CREATE TABLE outbox_events (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     processed_at TIMESTAMP WITH TIME ZONE
 );
-CREATE INDEX idx_outbox_events_pending ON outbox_events(status, created_at) WHERE status = 'PENDING';
+-- Optimized index for Outbox sweeper to handle status, retries, and sequential ordering
+CREATE INDEX idx_outbox_events_sweep ON outbox_events(status, retry_count, created_at) WHERE status = 'PENDING';
 
 -- API Request Idempotency Key Ledger
 CREATE TABLE idempotency_keys (
@@ -230,7 +242,7 @@ CREATE TABLE idempotency_keys (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(tenant_id, user_id, key_value)
 );
-CREATE INDEX idx_idempotency_expiry ON idempotency_keys(expires_at);
+CREATE INDEX idx_idempotency_expiry ON idempotency_keys(expires_at) WHERE expires_at < CURRENT_TIMESTAMP;
 ```
 
 ### 5. Billing, Invoices, & Payment Tracking
@@ -252,6 +264,7 @@ CREATE TABLE billing_invoices (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_invoices_tenant_status ON billing_invoices(tenant_id, status);
+CREATE INDEX idx_invoices_pdf_file ON billing_invoices(pdf_file_id); -- FK Index
 
 CREATE TABLE billing_invoice_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -263,6 +276,7 @@ CREATE TABLE billing_invoice_items (
     -- Enforce deterministic line calculation
     amount_cents BIGINT GENERATED ALWAYS AS (quantity * unit_price_cents) STORED
 );
+CREATE INDEX idx_invoice_items_invoice ON billing_invoice_items(invoice_id); -- FK Index
 
 CREATE TABLE payment_transactions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -278,6 +292,7 @@ CREATE TABLE payment_transactions (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_payments_invoice ON payment_transactions(invoice_id);
+CREATE INDEX idx_payments_tenant ON payment_transactions(tenant_id); -- FK Index
 ```
 
 ### 6. Symbol Master & Derivatives Support
@@ -300,6 +315,7 @@ CREATE TABLE market_holidays (
     trading_end_time TIME,
     UNIQUE(exchange_code, holiday_date)
 );
+CREATE INDEX idx_holidays_exchange ON market_holidays(exchange_code); -- FK Index
 
 CREATE TABLE market_symbols (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -312,6 +328,7 @@ CREATE TABLE market_symbols (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX idx_symbol_ticker_exchange ON market_symbols(ticker, exchange_code);
+CREATE INDEX idx_symbols_exchange ON market_symbols(exchange_code); -- FK Index
 
 CREATE TABLE derivatives_contracts (
     symbol_id UUID PRIMARY KEY REFERENCES market_symbols(id) ON DELETE CASCADE,
@@ -323,9 +340,10 @@ CREATE TABLE derivatives_contracts (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_derivatives_expiry ON derivatives_contracts(expiry_date);
+CREATE INDEX idx_derivatives_underlying ON derivatives_contracts(underlying_symbol_id); -- FK Index
 ```
 
-### 7. Portfolios, Holdings, Orders, & Executions
+### 7. Portfolios, Holdings, Orders, & Double-Entry Ledger
 ```sql
 CREATE TABLE portfolios (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -340,6 +358,20 @@ CREATE TABLE portfolios (
 );
 CREATE INDEX idx_portfolios_user ON portfolios(tenant_id, user_id);
 
+-- Double-Entry Bookkeeping Ledger to ensure Financial Correctness
+CREATE TABLE portfolio_ledger_entries (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    portfolio_id UUID NOT NULL REFERENCES portfolios(id) ON DELETE RESTRICT,
+    type VARCHAR(31) NOT NULL, -- DEPOSIT, WITHDRAW, TRADE_BUY, TRADE_SELL, FEE, GST, STT
+    amount_cents BIGINT NOT NULL, -- Negative for debits, Positive for credits
+    balance_after_cents BIGINT NOT NULL CONSTRAINT check_ledger_bal_post CHECK (balance_after_cents >= 0),
+    reference_id VARCHAR(127), -- Linked Order ID or Transaction ID
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_portfolio_ledger_brin ON portfolio_ledger_entries USING brin(created_at);
+CREATE INDEX idx_portfolio_ledger_portfolio ON portfolio_ledger_entries(portfolio_id);
+
 CREATE TABLE holdings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -353,6 +385,7 @@ CREATE TABLE holdings (
 );
 -- Covering index for performance aggregation
 CREATE UNIQUE INDEX idx_holdings_covering ON holdings(portfolio_id, symbol_id) INCLUDE (quantity, average_cost_cents);
+CREATE INDEX idx_holdings_symbol ON holdings(symbol_id); -- FK Index
 
 CREATE TABLE orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -372,6 +405,7 @@ CREATE TABLE orders (
 -- Optimized Partial Index on Pending Orders
 CREATE INDEX idx_orders_pending_partial ON orders(portfolio_id) WHERE status = 'PENDING';
 CREATE INDEX idx_orders_brin ON orders USING brin(created_at);
+CREATE INDEX idx_orders_symbol ON orders(symbol_id); -- FK Index
 
 CREATE TABLE broker_integrations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -392,6 +426,7 @@ CREATE TABLE broker_accounts (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX idx_broker_account_user ON broker_accounts(user_id, integration_id);
+CREATE INDEX idx_broker_accounts_integration ON broker_accounts(integration_id); -- FK Index
 
 CREATE TABLE broker_orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -403,6 +438,8 @@ CREATE TABLE broker_orders (
     error_message TEXT,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_broker_orders_account ON broker_orders(broker_account_id); -- FK Index
+CREATE INDEX idx_broker_orders_order ON broker_orders(order_id); -- FK Index
 
 CREATE TABLE broker_trade_executions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -421,6 +458,7 @@ CREATE TABLE broker_trade_executions (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_trade_executions_broker ON broker_trade_executions(broker_order_id);
+CREATE INDEX idx_trade_executions_tenant ON broker_trade_executions(tenant_id); -- FK Index
 ```
 
 ### 8. Scanners, Watchlists, & Custom Strategies
@@ -440,6 +478,7 @@ CREATE TABLE watchlist_items (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (watchlist_id, symbol_id)
 );
+CREATE INDEX idx_watchlist_items_symbol ON watchlist_items(symbol_id); -- FK Index
 
 CREATE TABLE strategies (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -465,6 +504,7 @@ CREATE TABLE strategy_runs (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP WITH TIME ZONE
 );
+CREATE INDEX idx_strategy_runs_strategy ON strategy_runs(strategy_id); -- FK Index
 
 CREATE TABLE backtests (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -483,6 +523,7 @@ CREATE TABLE backtests (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP WITH TIME ZONE
 );
+CREATE INDEX idx_backtests_strategy ON backtests(strategy_id); -- FK Index
 
 CREATE TABLE scanners (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -495,6 +536,7 @@ CREATE TABLE scanners (
 );
 -- GIN index for JSONB rules search
 CREATE INDEX idx_scanners_rules_gin ON scanners USING gin(rules);
+CREATE INDEX idx_scanners_tenant ON scanners(tenant_id); -- FK Index
 
 CREATE TABLE scanner_runs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -504,6 +546,7 @@ CREATE TABLE scanner_runs (
     duration_ms INT
 );
 CREATE INDEX idx_scanner_runs_tenant_time ON scanner_runs(tenant_id, execution_time DESC);
+CREATE INDEX idx_scanner_runs_scanner ON scanner_runs(scanner_id); -- FK Index
 
 CREATE TABLE scanner_matches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -514,6 +557,7 @@ CREATE TABLE scanner_matches (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_scanner_matches_tenant_run ON scanner_matches(tenant_id, scanner_run_id);
+CREATE INDEX idx_scanner_matches_symbol ON scanner_matches(symbol_id); -- FK Index
 ```
 
 ### 9. AI Infrastructure & Model Accuracy Metadata
@@ -550,6 +594,7 @@ CREATE TABLE model_versions (
     metrics JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_model_versions_model ON model_versions(model_id); -- FK Index
 
 CREATE TABLE model_artifacts (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -558,6 +603,8 @@ CREATE TABLE model_artifacts (
     sha256_checksum VARCHAR(64) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_model_artifacts_ver ON model_artifacts(model_version_id); -- FK Index
+CREATE INDEX idx_model_artifacts_file ON model_artifacts(file_id); -- FK Index
 
 CREATE TABLE model_calibrations (
     model_version_id UUID PRIMARY KEY REFERENCES model_versions(id) ON DELETE CASCADE,
@@ -588,6 +635,7 @@ CREATE TABLE prediction_accuracies (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX idx_model_accuracy_eval ON prediction_accuracies(model_version_id, eval_date);
+CREATE INDEX idx_prediction_accuracies_ver ON prediction_accuracies(model_version_id); -- FK Index
 ```
 
 ### 10. Signals, AI Chat, & Explainability History
@@ -629,6 +677,7 @@ CREATE TABLE shap_explanations_history (
 );
 CREATE INDEX idx_shap_history_tenant ON shap_explanations_history(tenant_id);
 CREATE INDEX idx_shap_history_symbol ON shap_explanations_history(symbol_id);
+CREATE INDEX idx_shap_history_ver ON shap_explanations_history(model_version_id); -- FK Index
 
 CREATE TABLE ai_feedbacks (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -640,6 +689,7 @@ CREATE TABLE ai_feedbacks (
     followed_trade BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_feedbacks_signal ON ai_feedbacks(signal_id); -- FK Index
 
 CREATE TABLE ai_chat_histories (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -654,6 +704,7 @@ CREATE TABLE ai_chat_histories (
 );
 -- BRIN index on time-sequential chat events
 CREATE INDEX idx_ai_chat_brin ON ai_chat_histories USING brin(created_at);
+CREATE INDEX idx_ai_chat_ver ON ai_chat_histories(model_version_id); -- FK Index
 ```
 
 ### 11. Alert Configurations & API Usage Metrics
@@ -672,6 +723,7 @@ CREATE TABLE alert_rules (
 CREATE INDEX idx_alert_rules_params_gin ON alert_rules USING gin(condition_params);
 -- Partial index on active alert rules
 CREATE INDEX idx_alert_rules_active ON alert_rules(symbol_id) WHERE is_active = TRUE;
+CREATE INDEX idx_alert_rules_user ON alert_rules(user_id); -- FK Index
 
 CREATE TABLE alert_events (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -682,6 +734,8 @@ CREATE TABLE alert_events (
     trigger_message TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_alert_events_rule ON alert_events(rule_id); -- FK Index
+CREATE INDEX idx_alert_events_signal ON alert_events(signal_id); -- FK Index
 
 CREATE TABLE notification_preferences (
     user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -692,6 +746,7 @@ CREATE TABLE notification_preferences (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_preferences_tenant ON notification_preferences(tenant_id); -- FK Index
 
 CREATE TABLE notification_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -703,6 +758,7 @@ CREATE TABLE notification_logs (
     error_message TEXT,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_notification_logs_alert ON notification_logs(alert_event_id); -- FK Index
 
 CREATE TABLE api_usage_analytics (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -717,6 +773,7 @@ CREATE TABLE api_usage_analytics (
 );
 CREATE INDEX idx_api_usage_brin ON api_usage_analytics USING brin(created_at);
 CREATE INDEX idx_api_usage_metrics ON api_usage_analytics(tenant_id, endpoint_path, response_code);
+CREATE INDEX idx_api_usage_key ON api_usage_analytics(api_key_id); -- FK Index
 ```
 
 ### 12. Risk Management, Webhooks, & News/Sentiment Contexts
@@ -730,6 +787,7 @@ CREATE TABLE risk_rules (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_risk_rules_portfolio ON risk_rules(portfolio_id); -- FK Index
 
 CREATE TABLE risk_events (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -741,6 +799,8 @@ CREATE TABLE risk_events (
     resolved BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_risk_events_portfolio ON risk_events(portfolio_id);
+CREATE INDEX idx_risk_events_rule ON risk_events(risk_rule_id); -- FK Index
 
 CREATE TABLE webhook_subscriptions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -752,6 +812,7 @@ CREATE TABLE webhook_subscriptions (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX idx_webhooks_user ON webhook_subscriptions(user_id); -- FK Index
 
 CREATE TABLE news_articles (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -775,6 +836,7 @@ CREATE TABLE news_sentiment_scores (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX idx_news_sentiment_unique ON news_sentiment_scores(news_article_id, symbol_id);
+CREATE INDEX idx_news_sentiment_symbol ON news_sentiment_scores(symbol_id); -- FK Index
 
 CREATE TABLE economic_events (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -807,6 +869,7 @@ ALTER TABLE idempotency_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE billing_invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payment_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE portfolios ENABLE ROW LEVEL SECURITY;
+ALTER TABLE portfolio_ledger_entries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE holdings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE broker_accounts ENABLE ROW LEVEL SECURITY;
@@ -848,6 +911,7 @@ CREATE POLICY idempotency_isolation ON idempotency_keys FOR ALL USING (tenant_id
 CREATE POLICY invoices_isolation ON billing_invoices FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY payments_isolation ON payment_transactions FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY portfolios_isolation ON portfolios FOR ALL USING (tenant_id = get_current_tenant_id());
+CREATE POLICY ledger_isolation ON portfolio_ledger_entries FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY holdings_isolation ON holdings FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY orders_isolation ON orders FOR ALL USING (tenant_id = get_current_tenant_id());
 CREATE POLICY broker_accounts_isolation ON broker_accounts FOR ALL USING (tenant_id = get_current_tenant_id());
@@ -926,6 +990,17 @@ ALTER TABLE ohlcv_candles_1m SET (
     timescaledb.compress_orderby = 'time DESC'
 );
 SELECT add_compression_policy('ohlcv_candles_1m', INTERVAL '14 days');
+
+-- Real-Time Data Ingestion Quality Audit logs
+CREATE TABLE data_quality_logs (
+    time TIMESTAMP WITH TIME ZONE NOT NULL,
+    source VARCHAR(63) NOT NULL, -- TICK_INGEST, NEWS_INGEST
+    severity VARCHAR(15) NOT NULL, -- WARNING, CRITICAL
+    error_code VARCHAR(63) NOT NULL,
+    error_details JSONB NOT NULL
+);
+SELECT create_hypertable('data_quality_logs', 'time', chunk_time_interval => INTERVAL '7 days');
+CREATE INDEX idx_data_quality_source ON data_quality_logs(source, time DESC);
 ```
 
 ### 2. Continuous Aggregates (Rollups)
@@ -1161,6 +1236,6 @@ Enforces strict partition ordering by grouping events with transaction keys. Mes
 
 ---
 
-*Phase 3C — Physical Database Schema Design v1.2*
+*Phase 3C — Physical Database Schema Design v1.3*
 *Status: Pending User Review and Approval*
 *Next Phase: Phase 4 — API Specification Design (awaiting approval)*
