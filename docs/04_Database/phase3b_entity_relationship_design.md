@@ -2,15 +2,15 @@
 ## AI-Powered Indian Stock Market Intelligence SaaS Platform
 
 > **Status**: Pending User Approval
-> **Version**: 1.0
-> **Depends On**: Phase 3A — Domain Model & Business Entities (Approved)
+> **Version**: 1.1 (Extended with AI Intelligence Entities)
+> **Depends On**: Phase 3A.1 — Domain Model Extension (Approved)
 > **Next Phase**: Phase 3C — Database Schema Design
 
 ---
 
 ## Part 1: Bounded Contexts (DDD Mapping)
 
-To control complexity across our 49 business entities, we partition the platform into **7 Bounded Contexts**. Each context contains a clear aggregate root, strict transactional boundaries, and well-defined interfaces (APIs or events) for communicating across contexts.
+To control complexity across our 59 business entities, we partition the platform into **8 Bounded Contexts**. Each context contains a clear aggregate root, strict transactional boundaries, and well-defined interfaces (APIs or events) for communicating across contexts.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -28,14 +28,15 @@ To control complexity across our 49 business entities, we partition the platform
 │  │  Portfolio & Trading   │  │  Strategy & Backtest   │  │    Alerts     │  │
 │  │   *Portfolio (AR)      │  │   *Strategy (AR)       │  │ *AlertRule(AR)│  │
 │  │   *BrokerAccount (AR)  │  │   *Backtest (AR)       │  │               │  │
-│  └───────────┬────────────┘  └────────────────────────┘  └───────────────┘  │
-│              │                                                              │
-│              │ Governs                                                      │
-│              ▼                                                              │
-│  ┌────────────────────────┐                                                 │
-│  │    Risk Management     │             (AR) = Aggregate Root               │
-│  │   *RiskRule (AR)       │                                                 │
-│  └────────────────────────┘                                                 │
+│  │                        │  │   *Scanner (AR)        │  │               │  │
+│  └───────────┬────────────┘  └───────────┬────────────┘  └───────────────┘  │
+│              │                           │                                  │
+│              │ Governs                   │ Signals                          │
+│              ▼                           ▼                                  │
+│  ┌────────────────────────┐  ┌────────────────────────┐                     │
+│  │    Risk Management     │  │     Signal Context     │                     │
+│  │   *RiskRule (AR)       │  │   *TradeSignal (AR)    │ (AR) = Aggregate Root│
+│  └────────────────────────┘  └────────────────────────┘                     │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -81,7 +82,7 @@ Every entity relationship in the platform is specified below with type, ownershi
 - **Relationship**: N:N (Many Roles to Many Permissions)
 - **Ownership**: System/Tenant owned.
 - **Cascade Rules**: `ON DELETE RESTRICT` (Permissions cannot be deleted if active in roles; role deletion removes map records).
-- **Multi-Tenant Considerations**: Default roles are system-global; custom roles mapped to specific permissions are isolated to the tenant.
+- **Multi-Tenant Considerations**: Default roles are shared across tenants; custom roles mapped to specific permissions are isolated to the tenant.
 - **Security Implications**: Access control maps directly to these permissions at the API Gateway.
 
 #### R6: Subscription Plan ── Tenant
@@ -100,7 +101,7 @@ Every entity relationship in the platform is specified below with type, ownershi
 - **Ownership**: User owns Portfolio.
 - **Cascade Rules**: `ON DELETE CASCADE` (Or soft-delete via flag).
 - **Multi-Tenant Considerations**: Portfolio explicitly carries `tenant_id` alongside `user_id` for dual query scoping.
-- **Security Implications**: portfolio views require owning-user credentials or Tenant Admin delegation.
+- **Security Implications**: Portfolio views require owning-user credentials or Tenant Admin delegation.
 
 #### R8: Portfolio ── Holding
 - **Relationship**: 1:N (One Portfolio to Many Holdings)
@@ -205,6 +206,80 @@ Every entity relationship in the platform is specified below with type, ownershi
 - **Multi-Tenant Considerations**: Shared context.
 - **Security Implications**: Explanation payloads must match prediction vectors.
 
+#### R20.1: Feature Store Version ── AI Feature
+- **Relationship**: 1:N (One Feature Store Version to Many AI Features)
+- **Ownership**: System configuration mapping.
+- **Cascade Rules**: `ON DELETE RESTRICT`.
+- **Multi-Tenant Considerations**: Shared global feature mappings.
+- **Security Implications**: Schema constraints enforce data completeness.
+
+#### R20.2: Model Version ── Model Monitoring
+- **Relationship**: 1:N (One Model Version to Many Monitoring Logs)
+- **Ownership**: System log.
+- **Cascade Rules**: `ON DELETE CASCADE`.
+- **Multi-Tenant Considerations**: System-wide logging metrics.
+- **Security Implications**: Read access limited to system administrators.
+
+#### R20.3: Model Version ── Model Drift
+- **Relationship**: 1:N (One Model Version to Many Drift Calculations)
+- **Ownership**: System validation data.
+- **Cascade Rules**: `ON DELETE CASCADE`.
+- **Multi-Tenant Considerations**: Global operational alert limits.
+- **Security Implications**: Drift indicators trigger model hot-swapping or retraining loops.
+
+#### R20.4: Model Version ── Confidence Calibration
+- **Relationship**: 1:1 (One Model Version to One Confidence Calibration Matrix)
+- **Ownership**: System configuration data.
+- **Cascade Rules**: `ON DELETE CASCADE`.
+- **Multi-Tenant Considerations**: Shared prediction calibration across all tenants.
+- **Security Implications**: Calibration weights must be validated against tampering.
+
+#### R20.5: AI Prompt Library ── SHAP Explanation
+- **Relationship**: 1:N (One Prompt Configuration to Many Generated SHAP Explanations)
+- **Ownership**: System template structure.
+- **Cascade Rules**: `ON DELETE RESTRICT` (Prompts in active use cannot be deleted).
+- **Multi-Tenant Considerations**: Shared standard templates; custom prompts isolated per tenant.
+- **Security Implications**: Escapes few-shot templates to mitigate prompt injection risks.
+
+---
+
+### Trade Signal Context Mappings (Extended Domain)
+
+#### R20.6: AI Prediction ── Trade Signal
+- **Relationship**: 1:N (One Prediction can yield Multiple Trade Signals across timeframes)
+- **Ownership**: System generated data.
+- **Cascade Rules**: `ON DELETE CASCADE` (Or retention-bound pruning).
+- **Multi-Tenant Considerations**: Consumed by tenant rules to execute localized portfolio checks.
+- **Security Implications**: Verification signature must be attached to the Trade Signal structure.
+
+#### R20.7: Trade Signal ── Signal Performance
+- **Relationship**: 1:1 (One Signal to One Performance outcome)
+- **Ownership**: System audited ledger.
+- **Cascade Rules**: `ON DELETE RESTRICT` (Performance calculations must be kept as historical ledger).
+- **Multi-Tenant Considerations**: Shared metrics globally referenced.
+- **Security Implications**: Read-only validation rules enforce performance metrics consistency.
+
+#### R20.8: Trade Signal ── AI Feedback
+- **Relationship**: 1:N (One Signal to Many User Feedbacks)
+- **Ownership**: User owns Feedback.
+- **Cascade Rules**: `ON DELETE CASCADE`.
+- **Multi-Tenant Considerations**: Isolated by User and Tenant scopes.
+- **Security Implications**: Retraining jobs read feedback vectors without loading user PII.
+
+#### R20.9: User ── Scanner
+- **Relationship**: 1:N (One User to Many Custom Scanners)
+- **Ownership**: User owns Scanner.
+- **Cascade Rules**: `ON DELETE CASCADE`.
+- **Multi-Tenant Considerations**: Strictly isolated by Tenant context limits.
+- **Security Implications**: Resource-bound queries prevent execution timeouts.
+
+#### R20.10: Scanner ── Scanner Result
+- **Relationship**: 1:N (One Scanner to Many Results)
+- **Ownership**: Ephemeral transaction result.
+- **Cascade Rules**: `ON DELETE CASCADE`.
+- **Multi-Tenant Considerations**: Inherits scanner context isolation.
+- **Security Implications**: Fast eviction strategies in Redis cache prevent memory leak vulnerabilities.
+
 ---
 
 ### Trading & Broker Context Mappings
@@ -255,7 +330,7 @@ Every entity relationship in the platform is specified below with type, ownershi
 #### R26: Portfolio ── Risk Event
 - **Relationship**: 1:N (One Portfolio to Many Risk Events)
 - **Ownership**: Portfolio owns Risk Event.
-- **Cascade Rules**: `ON DELETE CASCADE` (If portfolio is deleted, historical breaches are removed, audit trails kept in system logs).
+- **Cascade Rules**: `ON DELETE CASCADE`.
 - **Multi-Tenant Considerations**: Tenant-isolated log.
 - **Security Implications**: Immutable risk log.
 
@@ -350,55 +425,91 @@ Every entity relationship in the platform is specified below with type, ownershi
 └──────────┘ └──────────┘
 ```
 
-### 2. Market Data Context
+### 2. AI & Model Monitoring Context (Extended)
 
 ```
-┌──────────────┐
-│   Exchange   │
-└──────┬───────┘
-       │ 1
-       │
-       │ N
-┌──────▼───────┐ 1          N ┌──────────────┐
-│Market Symbol ├─────────────▶│  OHLCV Price │
-└──┬────────┬──┘              └──────────────┘
-   │ 1      │ 1
-   │        │
-   │ N      │ N
-┌──▼───────┐┌▼──────────────┐
-│Indicator ││Sentiment/News │
-└──────────┘└───────────────┘
+       ┌────────────────┐
+       │ Model Registry │
+       └───────┬────────┘
+               │ 1
+               │
+               │ N
+       ┌───────▼────────┐
+       │    AI Model    │
+       └───────┬────────┘
+               │ 1
+               │
+               │ N
+       ┌───────▼────────┐           ┌──────────────────────┐
+       │ Model Version  │◀──────────┤ FeatureStore Version │
+       └─┬───┬───┬───┬──┘           └──────────────────────┘
+         │   │   │   │
+         │   │   │   └───────────────┐ 1:1
+         │   │   │                   ▼
+         │   │   │          ┌──────────────────────┐
+         │   │   │          │Confidence Calibration│
+         │   │   │          └──────────────────────┘
+         │   │   │
+         │   │   └───────────┐ 1:N
+         │   │               ▼
+         │   │      ┌──────────────────────┐
+         │   │      │   Model Monitoring   │
+         │   │      └──────────┬───────────┘
+         │   │                 │ 1
+         │   │                 │
+         │   │                 │ N
+         │   │      ┌──────────▼───────────┐
+         │   └─────▶│     Model Drift      │
+         │          └──────────────────────┘
+         │
+         │ 1:N
+         ▼
+ ┌──────────────┐ 1      1:1 ┌──────────────┐
+ │ AI Prediction├───────────▶│ SHAP Explan. │
+ └───────┬──────┘            └───────▲──────┘
+         │ 1                         │ N
+         │                           │
+         │ N                         │ 1
+ ┌───────▼──────┐           ┌────────┴──────┐
+ │ Trade Signal ├──────────▶│Prompt Library │
+ └──────────────┘           └───────────────┘
 ```
 
-### 3. AI Context
+### 3. Trade Signal & Scanner Performance Context (Extended)
 
 ```
-┌──────────────┐
-│Model Registry│
-└──────┬───────┘
-       │ 1
-       │
-       │ N
-┌──────▼───────┐
-│   AI Model   │
-└──────┬───────┘
-       │ 1
-       │
-       │ N
-┌──────▼───────┐
-│Model Version │
-└──────┬───────┘
-       │ 1
-       │
-       │ N
-┌──────▼───────┐ 1          1:1 ┌──────────────┐
-│ AI Prediction├───────────────▶│SHAP Explan.  │
-└──────────────┘                └──────────────┘
+        ┌──────────────┐             ┌──────────────┐
+        │     User     │             │    Tenant    │
+        └─┬──────────┬─┘             └─┬──────────┬─┘
+          │          │                 │          │
+          │ 1:N      └────────┐        │ 1:N      │
+          ▼                   ▼        ▼          │
+ ┌────────────────┐ 1:N ┌──────────────┐          │
+ │    Scanner     ├────▶│ ScannerResult│          │
+ └────────┬───────┘     └────────▲─────┘          │
+          │                      │                │
+          └──────────────────────┼────────────────┘
+                                 │ 1:N
+                                 ▼
+                        ┌────────────────┐
+                        │ Market Symbol  │
+                        └────────▲───────┘
+                                 │ 1:N
+                                 ▼
+                        ┌────────────────┐ 1    1:1 ┌─────────────────┐
+                        │  Trade Signal  ├─────────▶│SignalPerformace │
+                        └────────┬───────┘          └─────────────────┘
+                                 │ 1
+                                 │
+                                 │ N
+                        ┌────────▼───────┐
+                        │  AI Feedback   │
+                        └────────────────┘
 ```
 
 ---
 
-## Part 5: Relationship Summary Table
+## Part 5: Relationship Summary Table (Extended)
 
 | Parent Entity | Child Entity | Type | Cascade Rule | Multi-tenant Constraint | Security Control |
 |---|---|---|---|---|---|
@@ -416,7 +527,7 @@ Every entity relationship in the platform is specified below with type, ownershi
 | `User` | `Alert Rule` | 1:N | `ON DELETE CASCADE` | Limit quotas per plan | Rule creation limits |
 | `Alert Rule` | `Alert Event` | 1:N | `ON DELETE SET NULL` | Mapped under tenant ID | Scope rules |
 | `Alert Event` | `Notification Log` | 1:N | `ON DELETE CASCADE` | Log scoping | Suppress routing PII |
-| `Exchange` | `Market Symbol` | 1:N | `ON DELETE RESTRICT` | Global metadata | Admin write authorization |
+| `Exchange` | `Market Symbol` | 1:N | `ON DELETE RESTRICT` | Global data | Admin write authorization |
 | `Market Symbol` | `Historical Price` | 1:N | `ON DELETE CASCADE` | Global access | Read-only |
 | `Market Symbol` | `Technical Ind.` | 1:N | `ON DELETE CASCADE` | Read access | Read-only |
 | `Model Version` | `AI Prediction` | 1:N | `ON DELETE CASCADE` | Global access | Cryptographic sig verification |
@@ -427,9 +538,19 @@ Every entity relationship in the platform is specified below with type, ownershi
 | `Strategy` | `Strategy Run` | 1:N | `ON DELETE CASCADE` | Scoped to tenant | Run limit checks |
 | `Portfolio` | `Risk Event` | 1:N | `ON DELETE CASCADE` | Tenant-scoped log | Immutable write logs |
 | `Tenant` | `Audit Log` | 1:N | `ON DELETE RESTRICT` | Tenant logs | Write-once read-many |
+| `FeatureStore Ver`| `AI Feature` | 1:N | `ON DELETE RESTRICT` | Shared schema | Version check constraints |
+| `Model Version` | `Model Monitoring` | 1:N | `ON DELETE CASCADE` | Admin logging only | Restricted admin views |
+| `Model Version` | `Model Drift` | 1:N | `ON DELETE CASCADE` | Global state checks | Auto retraining trigger hooks |
+| `Model Version` | `Conf. Calibration`| 1:1 | `ON DELETE CASCADE` | Shared coefficients | Read-only access |
+| `AI Prompt Lib` | `SHAP Explanation`| 1:N | `ON DELETE RESTRICT` | Template versioning | Strict sanitization checks |
+| `AI Prediction` | `Trade Signal` | 1:N | `ON DELETE CASCADE` | Tenant evaluation checks| Hash signatures enforced |
+| `Trade Signal` | `Signal Performance`| 1:1 | `ON DELETE RESTRICT` | Shared stat reference | Read-only logs |
+| `Trade Signal` | `AI Feedback` | 1:N | `ON DELETE CASCADE` | Scoped to active User | PII scrub runs |
+| `User` | `Scanner` | 1:N | `ON DELETE CASCADE` | Scoped to Tenant quotas | Rate limit controls |
+| `Scanner` | `Scanner Result` | 1:N | `ON DELETE CASCADE` | Inherited context | Fast Redis eviction |
 
 ---
 
-*Phase 3B — Entity Relationship Design v1.0*
+*Phase 3B — Extended Entity Relationship Design v1.1*
 *Status: Pending User Review and Approval*
 *Next Phase: Phase 3C — Database Schema Design (awaiting approval)*

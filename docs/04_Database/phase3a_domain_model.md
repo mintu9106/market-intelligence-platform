@@ -2,9 +2,9 @@
 ## AI-Powered Indian Stock Market Intelligence SaaS Platform
 
 > **Status**: Pending User Approval
-> **Version**: 1.0
+> **Version**: 1.1 (Extended with AI Intelligence Entities)
 > **Depends On**: Phase 2 (Architecture, Data Flows, Tech Stack) — Approved
-> **Next Phase**: Phase 3B — Database Schema Design
+> **Next Phase**: Phase 3B — Entity Relationship Design (ERD)
 
 ---
 
@@ -358,6 +358,7 @@ This document defines the core domain model and business entities. Every entity 
 - **Owned By**: System
 - **Relationships**:
   - Many-to-One with `Market Symbol`
+  - Many-to-One with `Feature Store Version`
 - **Lifecycle**: Computed in stream processing -> Written to Feature Store -> Read for inference -> Archived for training.
 - **Security Considerations**: Model features are proprietary IP. Read paths are restricted.
 - **Multi-Tenant Considerations**: Shared dataset utilized by all tenant inference calls.
@@ -390,6 +391,10 @@ This document defines the core domain model and business entities. Every entity 
 - **Relationships**:
   - Many-to-One with `AI Model`
   - One-to-Many with `AI Prediction`
+  - One-to-Many with `Model Monitoring`
+  - One-to-Many with `Model Drift`
+  - One-to-One with `Confidence Calibration`
+  - Many-to-One with `Feature Store Version`
 - **Lifecycle**: Draft (training) -> Evaluated -> Candidate (challenger) -> Production (champion) -> Deprecated.
 - **Security Considerations**: Model weights are checked for file integrity (checksums).
 - **Multi-Tenant Considerations**: Serves inference requests dynamically across all tenants.
@@ -402,6 +407,7 @@ This document defines the core domain model and business entities. Every entity 
   - Many-to-One with `Model Version`
   - Many-to-One with `Market Symbol`
   - One-to-One with `SHAP Explanation`
+  - One-to-Many with `Trade Signal`
 - **Lifecycle**: Generated -> Written to stream -> Read by signal engines -> Archived after 14 days.
 - **Security Considerations**: Integrity protected to prevent fraudulent trade signaling.
 - **Multi-Tenant Considerations**: Shared prediction stream consumed by tenant-specific signal processors.
@@ -412,9 +418,125 @@ This document defines the core domain model and business entities. Every entity 
 - **Owned By**: System
 - **Relationships**:
   - One-to-One with `AI Prediction`
+  - Many-to-One with `AI Prompt Library`
 - **Lifecycle**: Computed during inference -> Delivered with predictions -> Displayed on User interface.
 - **Security Considerations**: Proprietary SHAP configuration data must not be exposed.
 - **Multi-Tenant Considerations**: Shared explanation payload; displayed contextually under user watchlists/portfolios.
+
+---
+
+### AI Intelligence (Extended Domain Models)
+
+#### 50. Trade Signal
+- **Purpose**: Represents an actionable trade recommendation derived from the fusion of strategy rules and AI models.
+- **Responsibilities**: Stores direction (BUY/SELL), entry parameters, stop-loss, profit targets, combined confidence score, rationale snippet, and state validation.
+- **Owned By**: System (Global recommendations) / Tenant (Tenant-custom signal setup)
+- **Relationships**:
+  - Many-to-One with `Market Symbol`
+  - Many-to-One with `AI Prediction`
+  - One-to-One with `Signal Performance`
+  - One-to-Many with `AI Feedback`
+  - One-to-Many with `Alert Event`
+- **Lifecycle**: Generated -> Published -> Active (until Target/SL hit or expired) -> Archived.
+- **Security Considerations**: High-integrity signature validation prevents fraudulent signal insertion. Encryption keys are stored in AWS Secrets Manager.
+- **Multi-Tenant Considerations**: Global signals are tenant-agnostic; tenant-customized signals are isolated under the tenant scope.
+
+#### 51. Signal Performance
+- **Purpose**: Performs post-trade quantitative evaluation of trade signals.
+- **Responsibilities**: Tracks entry execution, maximum favorable excursion (MFE), maximum adverse excursion (MAE), and final outcomes (SL hit, Target hit, Expiry).
+- **Owned By**: System
+- **Relationships**:
+  - One-to-One with `Trade Signal`
+- **Lifecycle**: Created at signal completion -> Metrics processed -> Saved as immutable performance ledger.
+- **Security Considerations**: Read-only after final metrics write. Used for public strategy verification.
+- **Multi-Tenant Considerations**: Shared analysis logs available to all subscribers to ensure accuracy audit transparency.
+
+#### 52. AI Feedback
+- **Purpose**: Captures user feedback on signal quality and trade behavior to refine future training inputs.
+- **Responsibilities**: Records user ratings, execution notes, qualitative commentary, and structured feedback metrics.
+- **Owned By**: User
+- **Relationships**:
+  - Many-to-One with `Trade Signal`
+  - Many-to-One with `User`
+- **Lifecycle**: Created -> Submitted -> Saved (PII scrubbed) -> Consolidated in training dataset.
+- **Security Considerations**: PII scrubbed from comments before dataset compilation.
+- **Multi-Tenant Considerations**: Feedback lists are isolated strictly by User and Tenant.
+
+#### 53. Scanner
+- **Purpose**: Represents a real-time screening filter configuration.
+- **Responsibilities**: Holds filter specifications (indicator levels, price parameters, volume criteria, AI feature conditions) and symbol universe constraints.
+- **Owned By**: User (Custom Scanners) / Tenant (Tenant Group Scanners) / System (Built-in Scanners)
+- **Relationships**:
+  - Many-to-One with `Tenant`
+  - Many-to-One with `User`
+  - One-to-Many with `Scanner Result`
+- **Lifecycle**: Draft -> Active -> Suspended -> Retired.
+- **Security Considerations**: Scanners are rate-limited to avoid system resource starvation.
+- **Multi-Tenant Considerations**: Isolated strictly under the respective Tenant domain.
+
+#### 54. Scanner Result
+- **Purpose**: The output match of a scanner execution.
+- **Responsibilities**: Records matched symbols and matching indicator/feature values at a specific execution timestamp.
+- **Owned By**: User (via active query cache)
+- **Relationships**:
+  - Many-to-One with `Scanner`
+  - Many-to-One with `Market Symbol`
+- **Lifecycle**: Ephemeral. Cached in Redis (TTL: 1 minute) -> Expired and replaced.
+- **Security Considerations**: Read-only access constraints.
+- **Multi-Tenant Considerations**: Inherits scanner context isolation.
+
+#### 55. Feature Store Version
+- **Purpose**: Tracks feature sets versioning.
+- **Responsibilities**: Defines schema configurations, data type validation logic, and ingestion version flags.
+- **Owned By**: System
+- **Relationships**:
+  - One-to-Many with `AI Feature`
+  - One-to-Many with `Model Version`
+- **Lifecycle**: Draft -> Active -> Deprecated.
+- **Security Considerations**: Configurations are protected.
+- **Multi-Tenant Considerations**: Global feature store definition.
+
+#### 56. Model Monitoring
+- **Purpose**: Tracks live performance metrics of deployed AI Models.
+- **Responsibilities**: Records execution latency (P50/P90/P99), throughput, CPU/GPU utilization, and memory usage.
+- **Owned By**: System
+- **Relationships**:
+  - Many-to-One with `Model Version`
+  - One-to-Many with `Model Drift`
+- **Lifecycle**: Logged per inference batch -> Aggregated hourly -> Stored in time-series logs.
+- **Security Considerations**: Accessible only to System Admins.
+- **Multi-Tenant Considerations**: System-wide operational logs.
+
+#### 57. Model Drift
+- **Purpose**: Tracks changes in data distribution (data drift) or concept distribution (concept drift).
+- **Responsibilities**: Records population stability index (PSI) scores, Wasserstein distance, and divergence values.
+- **Owned By**: System
+- **Relationships**:
+  - Many-to-One with `Model Version`
+  - Many-to-One with `Model Monitoring`
+- **Lifecycle**: Calculated daily -> Triggers warning state -> Retraining pipeline executed -> Resolved.
+- **Security Considerations**: System Admin access only.
+- **Multi-Tenant Considerations**: System-wide monitoring.
+
+#### 58. Confidence Calibration
+- **Purpose**: Calibrates prediction probabilities to match real-world accuracies.
+- **Responsibilities**: Holds temperature scaling variables and isotonic regression weights.
+- **Owned By**: System
+- **Relationships**:
+  - One-to-One with `Model Version`
+- **Lifecycle**: Computed during validation -> Used dynamically during inference -> Updated.
+- **Security Considerations**: Protected weights.
+- **Multi-Tenant Considerations**: Global calibration matrix.
+
+#### 59. AI Prompt Library
+- **Purpose**: Central library for LLM templates used in generating explanations.
+- **Responsibilities**: Stores system prompt templates, few-shot contexts, and parameters.
+- **Owned By**: System (Global Templates) / Tenant (Enterprise Customized Templates)
+- **Relationships**:
+  - One-to-Many with `SHAP Explanation`
+- **Lifecycle**: Draft -> Active -> Deprecated.
+- **Security Considerations**: Sanitizes inputs to prevent prompt injection attacks.
+- **Multi-Tenant Considerations**: Custom templates are isolated.
 
 ---
 
@@ -504,6 +626,7 @@ This document defines the core domain model and business entities. Every entity 
 - **Relationships**:
   - Many-to-One with `Tenant`
   - Many-to-One with `Portfolio`
+  - One-to-Many with `Risk Event`
 - **Lifecycle**: Defined -> Active -> Deactivated.
 - **Security Considerations**: Read-only for standard users. Must not be bypassable during execution.
 - **Multi-Tenant Considerations**: Global and tenant-specific rules evaluate within the tenant scope.
@@ -612,21 +735,30 @@ Below is the categorization of all identified business entities into their respe
   │ • Permission           │    │ • Model Version        │    │ • Broker Order         │
   │ • User Profile         │    │ • AI Prediction        │    └────────────────────────┘
   │ • Session              │    │ • SHAP Explanation     │                │
-  │ • API Key              │    └────────────────────────┘                │ Executes
-  └───────────┬────────────┘                 │                            ▼
-              │                              │              ┌────────────────────────┐
-              │                              ▼              │    PORTFOLIO DOMAIN    │
-              │                 ┌────────────────────────┐  │ • Portfolio            │
-              │                 │  BACKTEST & STRATEGY   │  │ • Holding              │
-              │                 │ • Strategy             │  └────────────────────────┘
-              │                 │ • Strategy Run         │                │
-              │                 │ • Backtest Config/Res  │                │ Evaluates
-              │                 └────────────────────────┘                ▼
-              │                              │              ┌────────────────────────┐
-              │                              ▼              │      RISK DOMAIN       │
-              │                 ┌────────────────────────┐  │ • Risk Rule            │
-              │                 │   NOTIFICATION DOMAIN  │  │ • Risk Event           │
-              │                 │ • Alert Rule           │  └────────────────────────┘
+  │ • API Key              │    │ • F. Store Version     │                │ Executes
+  └───────────┬────────────┘    │ • Model Monitoring     │                ▼
+              │                 │ • Model Drift          │    ┌────────────────────────┐
+              │                 │ • Conf. Calibration    │    │    PORTFOLIO DOMAIN    │
+              │                 │ • AI Prompt Library    │    │ • Portfolio            │
+              │                 └───────────┬────────────┘    │ • Holding              │
+              │                             │                 └────────────────────────┘
+              │                             ▼                             │
+              │                 ┌────────────────────────┐                │ Evaluates
+              │                 │  BACKTEST & STRATEGY   │                ▼
+              │                 │ • Strategy             │    ┌────────────────────────┐
+              │                 │ • Strategy Run         │    │      RISK DOMAIN       │
+              │                 │ • Backtest Config/Res  │    │ • Risk Rule            │
+              │                 │ • Trade Signal         │    │ • Risk Event           │
+              │                 │ • Signal Performance   │    └────────────────────────┘
+              │                 │ • AI Feedback          │
+              │                 │ • Scanner              │
+              │                 │ • Scanner Result       │
+              │                 └───────────┬────────────┘
+              │                             │
+              │                             ▼
+              │                 ┌────────────────────────┐
+              │                 │   NOTIFICATION DOMAIN  │
+              │                 │ • Alert Rule           │
               └────────────────▶│ • Alert Event          │
                                 │ • Notification Pref    │
                                 │ • Notification Log     │
@@ -646,8 +778,8 @@ Below is the categorization of all identified business entities into their respe
 - **Scope**: Live and historical market data pipelines, news aggregation, and indicator computation.
 
 ### 4. AI Domain
-- **Entities**: `AI Feature`, `Model Registry`, `AI Model`, `Model Version`, `AI Prediction`, `SHAP Explanation`
-- **Scope**: Model lifecycle, feature extraction, predictions, and SHAP explainability.
+- **Entities**: `AI Feature`, `Model Registry`, `AI Model`, `Model Version`, `AI Prediction`, `SHAP Explanation`, `Feature Store Version`, `Model Monitoring`, `Model Drift`, `Confidence Calibration`, `AI Prompt Library`
+- **Scope**: Model lifecycle, feature extraction, predictions, SHAP explainability, system logging, and drift calibration.
 
 ### 5. Portfolio Domain
 - **Entities**: `Portfolio`, `Holding`
@@ -658,8 +790,8 @@ Below is the categorization of all identified business entities into their respe
 - **Scope**: Pluggable broker execution and paper trading order matching.
 
 ### 7. Backtesting & Strategy Domain
-- **Entities**: `Strategy`, `Strategy Run`, `Backtesting Configuration & Result`
-- **Scope**: Strategy parameters, executions, and backtest results.
+- **Entities**: `Strategy`, `Strategy Run`, `Backtesting Configuration & Result`, `Trade Signal`, `Signal Performance`, `AI Feedback`, `Scanner`, `Scanner Result`
+- **Scope**: Strategy parameters, executions, backtest evaluations, and trade recommendations.
 
 ### 8. Alerts & Notification Domain
 - **Entities**: `Alert Rule`, `Alert Event`, `Notification Preference`, `Notification Log`
@@ -675,6 +807,6 @@ Below is the categorization of all identified business entities into their respe
 
 ---
 
-*Phase 3A — Domain Model & Business Entities v1.0*
+*Phase 3A.1 — Extended Domain Model & Business Entities v1.1*
 *Status: Pending User Review and Approval*
 *Next Phase: Phase 3B — Database Schema Design (awaiting approval)*
