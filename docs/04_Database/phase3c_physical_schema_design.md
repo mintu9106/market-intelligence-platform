@@ -2,9 +2,11 @@
 ## AI-Powered Indian Stock Market Intelligence SaaS Platform
 
 > **Status**: Approved
-> **Version**: 1.4 (Enterprise Hardened — Final Production Freeze)
+> **Version**: 1.5 (Final Production Hardening — Schema Freeze)
+> **Previous Version**: 1.4 (Enterprise Hardened)
 > **Depends On**: Phase 3A.1 & 3B.1 (Domain Models & ERD) — Approved
 > **Next Phase**: Phase 4 — API Specification Design
+> **Deployment Context**: Initial single-user/private production deployment. Schema is forward-compatible for future public SaaS evolution.
 
 ---
 
@@ -18,15 +20,52 @@ This schema implements all relational entities in **PostgreSQL 16**. To comply w
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS btree_gin;
 
--- Helper function to extract tenant ID from current transaction context
--- SECURITY DEFINER path hardened to prevent Search Path Hijacking
+-- ============================================================
+-- SECURITY: get_current_tenant_id()
+-- ============================================================
+-- Extracts the current tenant UUID from the session-local GUC
+-- 'app.current_tenant_id', which MUST be set by the application
+-- on every pooled connection before executing any SQL.
+--
+-- v1.5 CHANGE: Fail-fast behavior replaces silent NULL return.
+-- If the GUC is missing or empty, the function raises an exception
+-- immediately. This prevents RLS bypass on misconfigured connections
+-- (e.g. background workers, migration runners, or bare psql sessions).
+--
+-- SECURITY DEFINER is used so the function always executes with the
+-- privileges of its creator (a dedicated db-owner role), not the
+-- calling application role. SET search_path eliminates search-path
+-- hijacking by pinning execution to the public schema only.
+--
+-- OPERATIONAL CONTRACT:
+-- - All application connection pools MUST execute:
+--     SET app.current_tenant_id = '<tenant_uuid>';
+--   immediately after acquiring a connection, before any DML.
+-- - Migration runners and admin tools MUST connect using a role
+--   with BYPASSRLS privilege and must NEVER share the application
+--   connection pool. They should set:
+--     SET app.current_tenant_id = '00000000-0000-0000-0000-000000000000';
+--   as a sentinel value and bypass RLS explicitly.
+-- ============================================================
 CREATE OR REPLACE FUNCTION get_current_tenant_id()
 RETURNS UUID AS $$
+DECLARE
+    v_tenant_id TEXT;
 BEGIN
-    RETURN current_setting('app.current_tenant_id', true)::uuid;
+    v_tenant_id := current_setting('app.current_tenant_id', true);
+    IF v_tenant_id IS NULL OR trim(v_tenant_id) = '' THEN
+        RAISE EXCEPTION
+            'Security violation: app.current_tenant_id is not set in the current session. '
+            'All application connections must set this GUC before executing queries.'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN v_tenant_id::uuid;
 EXCEPTION
-    WHEN OTHERS THEN
-        RETURN NULL;
+    WHEN invalid_text_representation THEN
+        RAISE EXCEPTION
+            'Security violation: app.current_tenant_id contains an invalid UUID value: %',
+            v_tenant_id
+            USING ERRCODE = 'invalid_parameter_value';
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 ```
@@ -84,6 +123,17 @@ CREATE TABLE tenant_subscriptions (
 );
 CREATE INDEX idx_tenant_subs_tenant ON tenant_subscriptions(tenant_id);
 CREATE INDEX idx_tenant_subs_plan ON tenant_subscriptions(plan_id); -- FK Index
+
+-- ============================================================
+-- CONSTRAINT: One active subscription per tenant at a time.
+-- Prevents billing double-charge and non-deterministic quota
+-- enforcement caused by duplicate ACTIVE or TRIAL rows.
+-- PAST_DUE and CANCELLED rows are excluded — multiple historical
+-- records are valid (one per billing cycle).
+-- ============================================================
+CREATE UNIQUE INDEX idx_tenant_subs_one_active
+    ON tenant_subscriptions(tenant_id)
+    WHERE status IN ('TRIAL', 'ACTIVE');
 ```
 
 ### 3. Identity & Role-Based Access Control
@@ -92,7 +142,11 @@ CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     email VARCHAR(255) NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
+    -- TEXT (not VARCHAR) to accommodate all modern password hashing algorithms.
+    -- bcrypt: ~60 chars. PBKDF2: ~75 chars. Argon2id (NIST SP 800-63B): up to 95+ chars.
+    -- VARCHAR(255) would silently truncate Argon2id hashes under high-security
+    -- parameter configurations, breaking all future password verifications.
+    password_hash TEXT NOT NULL,
     status VARCHAR(31) NOT NULL DEFAULT 'ACTIVE', -- ACTIVE, SUSPENDED, PENDING_MFA
     mfa_secret VARCHAR(127),
     mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -195,17 +249,42 @@ CREATE TABLE file_storage_metadata (
 CREATE INDEX idx_files_tenant ON file_storage_metadata(tenant_id);
 CREATE INDEX idx_files_uploader ON file_storage_metadata(uploaded_by); -- FK Index
 
+-- ============================================================
+-- COMPLIANCE: audit_logs retention strategy (v1.5 change)
+-- ============================================================
+-- ON DELETE RESTRICT prevents physical deletion of audit log
+-- records when a tenant is deleted or offboarded. This is a
+-- mandatory compliance requirement:
+--   - SEBI regulations require audit trail retention for 5 years.
+--   - India IT Act Section 43A requires security incident records
+--     to be preserved regardless of customer lifecycle status.
+--   - GDPR deletion requests must anonymise PII (ip_address,
+--     user_agent, actor_email) but must NOT delete the audit event.
+--
+-- TENANT OFFBOARDING CONTRACT (application-layer):
+--   1. Mark tenant status = 'DEACTIVATED' (soft delete only).
+--   2. Anonymise PII in audit_logs: SET actor_email = 'redacted',
+--      ip_address = NULL, user_agent = NULL WHERE tenant_id = $id.
+--   3. Retain all audit rows for the compliance retention period.
+--   4. Hard deletion of a tenant record is only permitted after
+--      the retention period has elapsed and a legal hold check passes.
+--
+-- FUTURE ROADMAP: When multi-tenant scale requires it, migrate
+-- audit_logs to an append-only, immutable store (e.g. AWS QLDB,
+-- Kafka compacted topic, or a write-protected PostgreSQL table
+-- with a BEFORE DELETE trigger that raises an exception).
+-- ============================================================
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT, -- COMPLIANCE: no cascade delete
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    actor_email VARCHAR(255),
+    actor_email VARCHAR(255), -- anonymise on GDPR deletion, do not delete row
     action VARCHAR(127) NOT NULL, -- USER_LOGIN, PASSWORD_RESET, EXPORT_DATA
     resource_type VARCHAR(63) NOT NULL, -- PORTFOLIO, SUBSCRIPTION, SYSTEM
     resource_id VARCHAR(127),
     changes JSONB, -- Pre/Post state diffs
-    ip_address VARCHAR(45),
-    user_agent TEXT,
+    ip_address VARCHAR(45), -- anonymise on GDPR deletion
+    user_agent TEXT,        -- anonymise on GDPR deletion
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 -- BRIN index on time-sequential audit logs to save index space
@@ -424,11 +503,22 @@ CREATE TABLE broker_accounts (
     broker_client_id VARCHAR(127) NOT NULL,
     access_token_encrypted TEXT NOT NULL,
     refresh_token_encrypted TEXT,
+    -- encryption_key_version identifies which application-managed encryption key
+    -- was used to encrypt the token columns above. This enables selective
+    -- re-encryption row-by-row when a key rotation event occurs, without
+    -- requiring a full table lock or simultaneous user re-authorisation.
+    -- The actual key material lives in an external secrets manager (e.g. AWS KMS,
+    -- HashiCorp Vault). The application reads this version alongside the ciphertext
+    -- to select the correct decryption key. Default 1 = initial key version.
+    encryption_key_version INT NOT NULL DEFAULT 1,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX idx_broker_account_user ON broker_accounts(user_id, integration_id);
 CREATE INDEX idx_broker_accounts_integration ON broker_accounts(integration_id); -- FK Index
+-- Supports efficient identification of rows encrypted under an old key version
+-- during background re-encryption jobs after key rotation.
+CREATE INDEX idx_broker_accounts_key_ver ON broker_accounts(encryption_key_version);
 
 CREATE TABLE broker_orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -586,17 +676,52 @@ CREATE TABLE feature_store_versions (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- ============================================================
+-- AI GOVERNANCE: model_versions lifecycle (v1.5)
+-- ============================================================
+-- Valid status values are enforced at the database level via a
+-- CHECK constraint. Only status transitions permitted by the
+-- defined Finite State Machine (FSM) are allowed.
+--
+-- Permitted FSM transitions:
+--   CANDIDATE  -> STAGING   (promoted for shadow testing)
+--   CANDIDATE  -> FAILED    (evaluation failed)
+--   STAGING    -> PRODUCTION (promoted after A/B validation)
+--   STAGING    -> CANDIDATE  (demoted — needs more tuning)
+--   STAGING    -> FAILED    (shadow testing failed)
+--   PRODUCTION -> DEPRECATED (superseded by a newer model version)
+--   DEPRECATED -> (terminal — no further transitions allowed)
+--   FAILED     -> (terminal — no further transitions allowed)
+--
+-- ENFORCEMENT:
+--   The CHECK constraint below prevents any invalid status string
+--   from being written. The FSM transition rules documented above
+--   MUST be enforced by the application service layer (ModelService)
+--   when updating the status field. Do not allow direct SQL updates
+--   to model_versions.status from API handlers.
+--
+-- FUTURE ROADMAP: When model governance requires stricter guarantees,
+--   implement a PostgreSQL BEFORE UPDATE trigger that enforces the
+--   FSM transition matrix at the database level. For v1.5 (private
+--   deployment), application-layer enforcement is sufficient.
+-- ============================================================
 CREATE TABLE model_versions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     model_id UUID NOT NULL REFERENCES ai_models(id) ON DELETE CASCADE,
     version_string VARCHAR(63) NOT NULL,
-    status VARCHAR(31) NOT NULL DEFAULT 'CANDIDATE',
+    -- CHECK enforces valid status values. FSM transitions are enforced at app layer.
+    status VARCHAR(31) NOT NULL DEFAULT 'CANDIDATE'
+        CONSTRAINT chk_model_version_status
+        CHECK (status IN ('CANDIDATE', 'STAGING', 'PRODUCTION', 'DEPRECATED', 'FAILED')),
     feature_store_version_id UUID NOT NULL REFERENCES feature_store_versions(id) ON DELETE RESTRICT,
     hyperparameters JSONB NOT NULL DEFAULT '{}',
     metrics JSONB NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_model_versions_model ON model_versions(model_id); -- FK Index
+-- Supports fast queries for the currently active production model
+CREATE INDEX idx_model_versions_production ON model_versions(model_id, status)
+    WHERE status = 'PRODUCTION';
 
 CREATE TABLE model_artifacts (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -1236,8 +1361,215 @@ Enforces strict partition ordering by grouping events with transaction keys. Mes
   }
   ```
 
+### 3. Dead Letter Queue (DLQ) & Retry Topics
+
+> **v1.5 Addition**: The following DLQ and retry topics MUST be created alongside primary topics. Without them, a single poison message (malformed tick, invalid JSON from a third-party webhook) will stall the entire consumer group partition, halting signal generation during a live trading session.
+
+| Primary Topic | Retry Topic | DLQ Topic | Max Retries | Retry Backoff |
+|---|---|---|---|---|
+| `raw.market.ticks` | — | `raw.market.ticks.dlq` | 0 (no retry — stale ticks are worthless) | — |
+| `processed.candles` | `processed.candles.retry` | `processed.candles.dlq` | 3 | 1s, 5s, 30s |
+| `signals.final` | `signals.final.retry` | `signals.final.dlq` | 3 | 2s, 10s, 60s |
+| `alerts.outbound` | `alerts.outbound.retry` | `alerts.outbound.dlq` | 5 | 1s, 5s, 15s, 60s, 300s |
+
+**DLQ Consumer Contract**:
+- A dedicated DLQ monitor service must poll all `.dlq` topics.
+- Any message arriving in a DLQ must trigger a `CRITICAL` alert to the operations channel.
+- DLQ messages must be retained for 7 days for manual inspection and replay.
+- `raw.market.ticks.dlq` uses no retry — stale market data has zero recovery value. Log and discard.
+
+**FUTURE ROADMAP**: At enterprise scale, introduce Kafka Streams exactly-once semantics (EOS) with `isolation.level=read_committed` on consumers, a Schema Registry for Avro contract enforcement, and automated DLQ replay pipelines. For v1.5 private deployment, manual DLQ inspection and replay via a CLI tool is sufficient.
+
 ---
 
-*Phase 3C — Physical Database Schema Design v1.4*
-*Status: Approved*
-*Next Phase: Phase 4 — API Specification Design (awaiting approval)*
+## Part 6: Application-Layer Contracts
+
+The following production concerns are **not** implemented as database triggers in v1.5 (appropriate for a private single-user deployment). They are documented here as **mandatory application-layer contracts** that every service touching these tables MUST implement. They are architected to be retrofittable as database-level triggers at a later stage without any schema changes.
+
+---
+
+### Contract 1: Optimistic Concurrency Control (OCC) for Portfolios & Holdings
+
+**Applies to**: `portfolios`, `holdings`
+
+**Problem**: Both tables carry a `version INT` column. Without enforced checks, concurrent transactions can overwrite each other's changes, causing double-spending of paper trading capital or incorrect holding quantities.
+
+**Mandatory Pattern** (must be followed in `PortfolioService` and `HoldingsService`):
+```python
+# CORRECT — always include version predicate in UPDATE
+rows_updated = db.execute(
+    "UPDATE portfolios SET balance_cents = :new_balance, version = version + 1, "
+    "updated_at = NOW() WHERE id = :id AND version = :expected_version",
+    {"new_balance": new_balance, "id": portfolio_id, "expected_version": current_version}
+).rowcount
+
+if rows_updated == 0:
+    raise OptimisticLockError("Portfolio was modified by another transaction. Retry.")
+```
+- Always read `version` in the same transaction as the SELECT that precedes an UPDATE.
+- Always check `rowcount == 1` after UPDATE. If `rowcount == 0`, raise a retryable conflict error.
+- The API layer must translate `OptimisticLockError` to HTTP 409 Conflict.
+- **Never** issue a bare `UPDATE portfolios SET balance_cents = X WHERE id = Y` without the version check.
+
+**FUTURE ROADMAP**: Retrofit as a `BEFORE UPDATE` trigger on `portfolios` and `holdings` that raises `SQLSTATE 40001` (serialization failure) when `NEW.version != OLD.version + 1`.
+
+---
+
+### Contract 2: Ledger Serialization for portfolio_ledger_entries
+
+**Applies to**: `portfolio_ledger_entries`, `portfolios`
+
+**Problem**: The ledger stores a running `balance_after_cents`. Two concurrent writes computing this value independently will produce an incorrect ledger — one row will reflect a wrong running balance, creating silent drift between the ledger and the actual portfolio balance.
+
+**Mandatory Pattern** (must be followed in `LedgerService`):
+```python
+# Every ledger write MUST be wrapped in a transaction that locks the parent portfolio row
+with db.transaction():
+    # Row-level lock — blocks concurrent writes to the same portfolio
+    portfolio = db.execute(
+        "SELECT id, balance_cents, version FROM portfolios "
+        "WHERE id = :id FOR UPDATE",
+        {"id": portfolio_id}
+    ).fetchone()
+
+    new_balance = portfolio.balance_cents + amount_cents  # negative for debits
+    if new_balance < 0:
+        raise InsufficientFundsError()
+
+    db.execute(
+        "INSERT INTO portfolio_ledger_entries "
+        "(tenant_id, portfolio_id, type, amount_cents, balance_after_cents, reference_id) "
+        "VALUES (:tenant_id, :portfolio_id, :type, :amount, :new_balance, :ref)",
+        {...}
+    )
+    db.execute(
+        "UPDATE portfolios SET balance_cents = :new_balance, version = version + 1 "
+        "WHERE id = :id AND version = :expected_version",
+        {"new_balance": new_balance, "id": portfolio_id, "expected_version": portfolio.version}
+    )
+```
+- The `SELECT ... FOR UPDATE` is the serialization gate. Never write a ledger entry outside this pattern.
+- Both the INSERT into `portfolio_ledger_entries` and the UPDATE to `portfolios` must commit atomically.
+
+**FUTURE ROADMAP**: Validate `balance_after_cents` consistency server-side via a scheduled reconciliation job that compares `portfolios.balance_cents` against `SUM(portfolio_ledger_entries.amount_cents)` per portfolio.
+
+---
+
+### Contract 3: Invoice Header Reconciliation
+
+**Applies to**: `billing_invoices`, `billing_invoice_items`
+
+**Problem**: `billing_invoices.amount_cents` (header total) is a stored column independent of `billing_invoice_items.amount_cents` (generated line totals). They can drift apart due to application bugs or partial rollbacks.
+
+**Mandatory Pattern** (must be followed in `BillingService`):
+```python
+def finalise_invoice(invoice_id: UUID):
+    line_total = db.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM billing_invoice_items "
+        "WHERE invoice_id = :id", {"id": invoice_id}
+    ).scalar()
+
+    rows = db.execute(
+        "UPDATE billing_invoices SET amount_cents = :total, status = 'UNPAID' "
+        "WHERE id = :id AND status = 'DRAFT'",
+        {"total": line_total, "id": invoice_id}
+    ).rowcount
+
+    if rows == 0:
+        raise InvoiceStateError("Invoice is not in DRAFT state or was not found.")
+```
+- Invoices must go through a `DRAFT` state while line items are being added.
+- `amount_cents` on the header must only be written by `finalise_invoice()` — never by individual item writers.
+- Before marking an invoice `PAID`, assert `payment.amount_cents >= invoice.amount_cents`.
+
+---
+
+### Contract 4: Payment Amount Validation
+
+**Applies to**: `payment_transactions`, `billing_invoices`
+
+**Problem**: A payment webhook from Razorpay or Stripe can carry a manipulated or replayed `amount` that does not match the invoice amount. Recording it without validation silently activates a subscription that was not fully paid.
+
+**Mandatory Pattern** (must be followed in `PaymentWebhookHandler`):
+```python
+def handle_payment_settled(external_txn_id: str, paid_amount_cents: int, invoice_id: UUID):
+    # 1. Verify webhook HMAC signature BEFORE any DB operation
+    verify_webhook_signature(request)  # raises if invalid
+
+    # 2. Check idempotency — replay protection
+    if db.exists("payment_transactions", external_transaction_id=external_txn_id):
+        return  # already processed
+
+    # 3. Load and validate the invoice
+    invoice = db.get("billing_invoices", id=invoice_id)
+    if paid_amount_cents < invoice.amount_cents:
+        raise PaymentMismatchError(
+            f"Underpayment: received {paid_amount_cents}, expected {invoice.amount_cents}"
+        )
+
+    # 4. Write payment record and update invoice atomically
+    with db.transaction():
+        db.insert("payment_transactions", {
+            "invoice_id": invoice_id,
+            "external_transaction_id": external_txn_id,
+            "amount_cents": paid_amount_cents,
+            "status": "SETTLED",
+            ...
+        })
+        db.execute(
+            "UPDATE billing_invoices SET status = 'PAID' WHERE id = :id",
+            {"id": invoice_id}
+        )
+```
+- HMAC verification must happen before any database read or write.
+- Payment validation must happen before subscription activation.
+
+---
+
+### Contract 5: Redis Live Price Key TTL Management
+
+**Applies to**: `market:price:{symbol_id}` Redis keys
+
+**Problem**: Live price keys have no TTL. After market hours, keys for all 5,000+ symbols persist indefinitely. Over months, stale options/futures keys accumulate as new contract expiries are introduced, growing Redis memory monotonically until eviction pressure causes unpredictable key loss (potentially evicting sessions or rate limit counters).
+
+**Mandatory Pattern** (must be followed in `MarketDataIngestionService` and `SchedulerService`):
+```python
+# On every tick write — set or refresh TTL to market close + 30 minutes
+PIPELINE:
+  HSET market:price:{symbol_id} ltp_cents {ltp} volume {vol} ts {ts}
+  EXPIREAT market:price:{symbol_id} {market_close_unix + 1800}  # 17:00 IST
+
+# Scheduled job at 15:55 IST — pre-emptively refresh TTL on all active keys
+# to guard against clock skew or a missed tick EXPIREAT
+for symbol_id in active_symbols:
+    redis.expireat(f"market:price:{symbol_id}", next_market_close_timestamp + 1800)
+```
+- `active_symbols` is the set of all symbols with at least one active alert rule or watchlist entry.
+- Redis `maxmemory-policy` must be set to `volatile-lru` so that non-expiring keys (sessions, rate limits) are protected from eviction when memory pressure occurs.
+- Expired-key notification (keyspace events) should be disabled in production to avoid event flood.
+
+**FUTURE ROADMAP**: At scale, replace ad-hoc TTL management with a Redis Streams-based tick fan-out architecture where live prices are never stored in Redis — they are streamed to WebSocket consumers directly from a Kafka consumer bridge.
+
+---
+
+## Part 7: Future Roadmap Items
+
+The following architectural capabilities are intentionally deferred for the v1.5 private deployment. Each is documented with its trigger condition and implementation recommendation so it can be added without schema redesign.
+
+| # | Capability | Trigger Condition | Implementation Recommendation |
+|---|---|---|---|
+| 1 | OCC Trigger Enforcement | When concurrent trading volume > 100 req/sec on portfolios | PostgreSQL `BEFORE UPDATE` trigger on `portfolios` and `holdings` raising `SQLSTATE 40001` on version mismatch |
+| 2 | Immutable Audit Logs | When regulatory audit or SOC 2 compliance is required | Add `BEFORE DELETE` trigger on `audit_logs` that raises an exception unconditionally. Or migrate to AWS QLDB. |
+| 3 | Invoice Reconciliation Trigger | When billing team size > 1 or automated invoice generation is introduced | `CONSTRAINT TRIGGER DEFERRABLE` on `billing_invoices` validating header vs. line item sum |
+| 4 | Kafka EOS + Schema Registry | When consumer group lag > 5 seconds during market hours | Enable `isolation.level=read_committed`, deploy Confluent Schema Registry, add `.retry` topic consumers with exponential backoff |
+| 5 | Redis Streams Tick Fan-out | When WebSocket client count > 1,000 | Replace `market:price:*` Hash keys with Redis Streams (`XADD market.ticks.{symbol_id}`). Subscribe clients via `XREAD` instead of polling. |
+| 6 | Model FSM DB Trigger | When multiple engineers deploy models independently | PostgreSQL `BEFORE UPDATE` trigger enforcing the CANDIDATE → STAGING → PRODUCTION state machine |
+| 7 | Multi-region Read Replicas | When read query latency > 100ms P99 | PostgreSQL logical replication to a read replica in the same region. TimescaleDB streaming replication for tick data. |
+| 8 | Broker Token HSM Rotation | When broker OAuth tokens require compliance-grade key management | Integrate AWS KMS with automatic key rotation. Background job scans `broker_accounts` by `encryption_key_version`, re-encrypts rows on key change. |
+
+---
+
+*Phase 3C — Physical Database Schema Design v1.5*
+*Status: Approved — Final Production Hardening*
+*Deployment Context: Private single-user production. Forward-compatible for public SaaS evolution.*
+*Next Phase: Phase 4 — API Specification Design*
